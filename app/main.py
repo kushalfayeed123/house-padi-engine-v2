@@ -11,10 +11,11 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
-from dotenv import load_dotenv
 
 from app.agent_engine import housepadi_agent_graph
 from langchain.agents.middleware.types import InputAgentState
+
+from app.vector_service import get_model
 
 logger = getLogger("uvicorn")
 
@@ -27,10 +28,11 @@ class SystemStateContainer:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # --- STARTUP PHASE (Runs before the app goes live) ---
+    
     # 1. Target the absolute file location
     current_dir = Path(__file__).resolve().parent
     env_path = current_dir.parent / ".env"
-    
     logger.info(f"Explicitly targeting env configuration file path context: {env_path}")
     
     # 2. Pure Python Fallback parser to completely bypass python-dotenv issues
@@ -67,10 +69,20 @@ async def lifespan(app: FastAPI):
         supabase_url = supabase_url or "https://placeholder-url.supabase.co"
         supabase_key = supabase_key or "placeholder-anon-key"
 
+    # 3. Initialize dependency pool and register to global state
     logger.info("Initializing persistent Supabase Client connection instance pool...")
     supabase_client = create_client(supabase_url, supabase_key)
     app.state.system = SystemStateContainer(supabase_client=supabase_client)
-    yield
+
+    # 4. Pre-warm semantic memory weights
+    logger.info("Pre-warming semantic model memory...")
+    get_model()
+
+    # ------------------------------------------------------------------
+    yield  # Hand over control to FastAPI. Server is now officially ONLINE.
+    # ------------------------------------------------------------------
+
+    # --- SHUTDOWN PHASE (Runs when the server is stopping) ---
     logger.info("Tearing down service resources cleanly...")
 
 
