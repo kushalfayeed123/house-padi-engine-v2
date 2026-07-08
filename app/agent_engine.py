@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import StoreBackend
 from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI  # Swapped from ChatOllama to handle free cloud models
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver 
 
 from app.tools.property_ops import create_property_worker, search_properties_worker
@@ -66,15 +67,19 @@ EXECUTION RULES:
 - USER-FACING PRESENTATION SAFETY: When summarizing for the user, NEVER display raw database UUID strings (like 'id' or 'property_id'). Instead, hide them behind natural text links, reference numbers (e.g., "Option 1"), or drop them from the text entirely. The user does not need to see the UUID.
 """
 
-
 # --- 3. OpenRouter Free Infrastructure Configuration ---
 
+ollama_model = ChatOllama(
+    model="llama3.1:8b",  # Make sure you ran `ollama run llama3.1:8b` in your terminal first
+    temperature=0,
+    base_url="http://localhost:11434"  # Forces it to use your local hardware, 100% free
+)
+
 groq_model = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
     temperature=0,
 )
-
 
 dynamic_router_free = ChatOpenAI(
     model="openrouter/free",
@@ -84,7 +89,7 @@ dynamic_router_free = ChatOpenAI(
 )
 
 # Powerful 120B MoE model for high-reasoning supervisor mapping
-supervisor_model = dynamic_router_free
+supervisor_model = groq_model
 
 # Elite agentic coding/tool model for deterministic sub-agent JSON outputs
 worker_model = groq_model
@@ -98,14 +103,16 @@ property_agent: SubAgent = {
         "listings for renters, and cataloging/creating new property assets for owners."
     ),
     "system_prompt": (
-        "You are a strict single-turn property operations expert for HousePadi.\n\n"
-        "CRITICAL EXECUTION RULE:\n"
-        "You are permitted exactly ONE tool call per request. Once you call a tool and receive "
-        "its output, you MUST immediately accept that data as final truth, summarize the findings, "
-        "and stop execution. NEVER execute the same tool twice in a single turn.\n\n"
-        "OPERATIONAL CHANNELS:\n"
-        "1. For searching or listing matching apartments, invoke `search_properties_worker` once.\n"
-        "2. For adding a new property asset, invoke `create_property_worker` once."
+       "You are a strict property operations expert for HousePadi.\n\n"
+        "CRITICAL FOR ENTRY/CREATION WORKFLOWS:\n"
+        "If a landlord/owner wants to create or catalog a new property listing, you MUST explicitly "
+        "have the actual 'address', 'base_price', and 'location' from their message text.\n"
+        "- NEVER guess, invent, or hallucinate placeholder values (e.g., do NOT invent addresses like '123 Main St' or prices like '1200').\n"
+        "- If any of these fields are missing from the conversation context, you MUST stop immediately, do NOT call `create_property_worker`, and instead reply to the user asking them to provide the missing details (e.g., 'Please provide the address, price, and city location for your new listing.').\n\n"
+        "CRITICAL SEARCH WORKFLOWS:\n"
+        "- For searching or listing properties for a renter, you only need the location. If you have the location, call `search_properties_worker` immediately.\n\n"
+        "EXECUTION LIMIT:\n"
+        "You are permitted exactly ONE tool call per turn. Once you receive the tool payload, accept it as final truth and summarize it."
     ),
     "tools": [search_properties_worker, create_property_worker],
     "model": worker_model  
