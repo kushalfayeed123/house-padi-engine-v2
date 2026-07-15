@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import StoreBackend
 from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
+# removed ChatOllama import - local models not required in this deployment
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver 
 
@@ -111,9 +111,34 @@ openrouter_fallback = ChatOpenAI(
 # SUPERVISOR: Use Groq for routing decisions (very fast, handles rate limits well)
 supervisor_model = groq_model
 
-# WORKERS: Use Ollama for sub-agents (local, unlimited, deterministic outputs)
-# Falls back to Groq if Ollama unavailable
-worker_model = ollama_model
+# WORKERS: Use Groq as the primary worker model as local models are not available in this environment
+# OpenRouter can act as a tertiary fallback if needed
+worker_model = groq_model
+
+# --- 4. Lightweight Intent Router (reduces token usage) ---
+
+@tool("intent_router")
+def intent_router(text: str) -> str:
+    """Lightweight deterministic intent router to avoid expensive LLM calls for simple routing.
+    Uses keyword heuristics to map user intent to one of the specialist agents.
+    Returns the agent name (e.g., 'property-specialist', 'tour-specialist', etc.).
+    """
+    normalized = (text or "").lower()
+    # Simple keyword rules (expand as needed)
+    if any(k in normalized for k in ["search", "find", "list", "show me", "apart", "apartment", "studio", "2-bedroom", "3-bedroom", "property"]):
+        return "property-specialist"
+    if any(k in normalized for k in ["tour", "visit", "schedule", "book", "see the place"]):
+        return "tour-specialist"
+    if any(k in normalized for k in ["lease", "sign", "agreement", "contract", "lease agreement"]):
+        return "lease-specialist"
+    if any(k in normalized for k in ["pay", "payment", "rent", "wallet", "invoice"]):
+        return "payment-specialist"
+    if any(k in normalized for k in ["verify", "kyc", "identity", "id number", "id image"]):
+        return "kyc-specialist"
+    if any(k in normalized for k in ["message", "chat", "contact", "message owner", "message landlord"]):
+        return "chat-specialist"
+    # Fallback: let the supervisor model decide only when heuristics don't match
+    return "supervisor"
 
 # --- 4. Sub-Agent Definitions ---
 
@@ -210,7 +235,7 @@ tenant_isolated_store = StoreBackend(
 
 housepadi_agent_graph = create_deep_agent(
     model=supervisor_model,
-    tools=[write_todos],
+    tools=[write_todos, intent_router],
     system_prompt=SYSTEM_PROMPT,
     backend=tenant_isolated_store,
     subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
@@ -223,5 +248,9 @@ housepadi_agent_graph = create_deep_agent(
         }
     }
 )
+
+# Attach fallback model reference so runtime can use it if primary Groq becomes unreachable.
+# This doesn't change create_deep_agent internals but exposes an attribute the runner can consult.
+housepadi_agent_graph.fallback_model = openrouter_fallback
 
 housepadi_agent_graph.checkpointer = MemorySaver()
