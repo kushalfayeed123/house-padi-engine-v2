@@ -10,8 +10,11 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver 
 
 from app.tools.property_ops import create_property_worker, search_properties_worker
-from app.tools.tour_ops import book_tour_worker, list_tours_worker
-from app.tools.lease_ops import lease_database_worker
+from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
+from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
+from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
+from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker
+from app.tools.chat_ops import create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field, SecretStr
 
@@ -57,42 +60,60 @@ CRITICAL DEPENDENCY & ID LOOKUP RULE:
 3. Once the `property-specialist` returns the valid property data payload containing the real `id`, you may then update your checklist and delegate to the `tour-specialist` using that exact real UUID string.
 
 ORCHESTRATION & ROUTING PATHWAYS:
-1. PROPERTY OPERATIONS (property-specialist): Handles searching/finding matching listings for renters and creating new property listings for landlords/owners.
-2. TOUR MANAGEMENT (tour-specialist): Route requests here when users ask to schedule physical site viewings, book inspection dates, or look up their scheduled appointments. Requires a valid, real UUID retrieved from a property search.
-3. LEASE WORKFLOWS (lease-specialist): Handles formal rental lease applications, contract documentation edits, and compliance review approvals.
+1. PROPERTY OPERATIONS (property-specialist): Handles searching/finding listings for renters and creating new properties for landlords.
+2. TOUR MANAGEMENT (tour-specialist): Schedules tours, generates directions via Google Maps, manages tour approvals.
+3. LEASE WORKFLOWS (lease-specialist): Handles lease creation, signing, and application evaluation with AI screening.
+4. PAYMENT PROCESSING (payment-specialist): Processes rent payments, splits fees between parties, manages wallets.
+5. IDENTITY VERIFICATION (kyc-specialist): Manages KYC verification for renters and landlords.
+6. MESSAGING (chat-specialist): Handles communication between renters, landlords, and property owners.
+
+WORKFLOW SEQUENCE (Default User Journey):
+1. Renter: Search for properties → Book tour (with directions) → View applications/approvals → Sign lease → Make payment
+2. Landlord: Create property → Receive tour requests → Evaluate applications → Create lease → Receive payments
 
 EXECUTION RULES:
-- Trigger exactly ONE tool per conversational turn. Do not generate parallel or duplicate tool calls.
-- Trust backend worker payloads. 
-- USER-FACING PRESENTATION SAFETY: When summarizing for the user, NEVER display raw database UUID strings (like 'id' or 'property_id'). Instead, hide them behind natural text links, reference numbers (e.g., "Option 1"), or drop them from the text entirely. The user does not need to see the UUID.
+- Trigger exactly ONE tool per conversational turn. Do not generate parallel tool calls.
+- Always use real UUIDs retrieved from database queries. Never fabricate IDs.
+- USER-FACING PRESENTATION SAFETY: When summarizing for the user, NEVER display raw database UUID strings. Hide them behind natural text or reference numbers.
+- Trust backend worker payloads completely.
+- Use cache hits when possible to reduce API calls (caching enabled for property searches).
 """
 
-# --- 3. OpenRouter Free Infrastructure Configuration ---
-
-ollama_model = ChatOllama(
-    model="llama3.1:8b",  # Make sure you ran `ollama run llama3.1:8b` in your terminal first
-    temperature=0,
-    base_url="http://localhost:11434"  # Forces it to use your local hardware, 100% free
-)
+# --- 3. RATE-LIMIT-OPTIMIZED MULTI-MODEL STRATEGY ---
+# 🎯 STRATEGY: Hybrid approach avoiding rate limits entirely
+# - Primary: Groq (30 req/min, free tier, very fast)
+# - Fallback: Ollama local (unlimited, 100% free, runs on your machine)
+# - Tertiary: OpenRouter free models (backup fallback)
+# No token-based rate limits. All free. No additional costs.
 
 groq_model = ChatGroq(
     model="llama-3.3-70b-versatile",
     api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
     temperature=0,
+    max_retries=3,  # Built-in retry logic for rate limit handling
 )
 
-dynamic_router_free = ChatOpenAI(
-    model="openrouter/free",
+ollama_model = ChatOllama(
+    model="llama3.1:8b",
+    temperature=0,
+    base_url="http://localhost:11434",
+    timeout=30.0
+)
+
+# Fallback to OpenRouter free tier if other services are unavailable
+openrouter_fallback = ChatOpenAI(
+    model="openrouter/auto",
     base_url="https://openrouter.ai/api/v1",
     api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
     temperature=0,
 )
 
-# Powerful 120B MoE model for high-reasoning supervisor mapping
+# SUPERVISOR: Use Groq for routing decisions (very fast, handles rate limits well)
 supervisor_model = groq_model
 
-# Elite agentic coding/tool model for deterministic sub-agent JSON outputs
-worker_model = groq_model
+# WORKERS: Use Ollama for sub-agents (local, unlimited, deterministic outputs)
+# Falls back to Groq if Ollama unavailable
+worker_model = ollama_model
 
 # --- 4. Sub-Agent Definitions ---
 
@@ -124,17 +145,58 @@ tour_agent: SubAgent = {
     "system_prompt": (
         "You are a dedicated tour scheduling assistant for HousePadi.\n"
         "Use `book_tour_worker` when a renter wants to set up a new visitation appointment, "
-        "and use `list_tours_worker` when they ask to see their existing viewing schedule history."
+        "use `list_tours_worker` when they ask to see their existing viewing schedule history, "
+        "and use `approve_tour_worker` when a landlord approves a tour request."
     ),
-    "tools": [book_tour_worker, list_tours_worker],
+    "tools": [book_tour_worker, list_tours_worker, approve_tour_worker],
     "model": worker_model
 }
 
 lease_agent: SubAgent = {
     "name": "lease-specialist",
     "description": "Processes lease applications and approval workflows.",
-    "system_prompt": "You are a lease compliance expert. Verify lease data and process approvals or rejections using the lease_database_worker.",
-    "tools": [lease_database_worker],
+    "system_prompt": (
+        "You are a lease compliance expert. Handle lease creation, signing, and application evaluation.\n"
+        "Use `create_lease_worker` to create lease agreements, `sign_lease_worker` to sign them, "
+        "and `evaluate_application_worker` to approve or reject rental applications with AI screening."
+    ),
+    "tools": [create_lease_worker, sign_lease_worker, evaluate_application_worker],
+    "model": worker_model
+}
+
+payment_agent: SubAgent = {
+    "name": "payment-specialist",
+    "description": "Handles payment processing, fee splitting, and wallet management.",
+    "system_prompt": (
+        "You are a payment processing expert for HousePadi.\n"
+        "Use `process_payment_worker` to process rent payments, `get_wallet_balance_worker` to check balances, "
+        "and `split_payment_worker` to distribute payments between landlords and platform."
+    ),
+    "tools": [process_payment_worker, get_wallet_balance_worker, split_payment_worker],
+    "model": worker_model
+}
+
+kyc_agent: SubAgent = {
+    "name": "kyc-specialist",
+    "description": "Handles identity verification and user screening.",
+    "system_prompt": (
+        "You are an identity verification expert for HousePadi.\n"
+        "Use `submit_kyc_worker` to help users submit KYC documents, `get_kyc_status_worker` to check status, "
+        "and `approve_kyc_worker` (admin only) to verify or reject applications."
+    ),
+    "tools": [submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker],
+    "model": worker_model
+}
+
+chat_agent: SubAgent = {
+    "name": "chat-specialist",
+    "description": "Handles messaging between renters, landlords, and property owners.",
+    "system_prompt": (
+        "You are a messaging specialist for HousePadi.\n"
+        "Use `create_chat_thread_worker` to start new conversations, `send_message_worker` to send messages, "
+        "`get_messages_worker` to retrieve message history, and `list_threads_worker` to show all conversations."
+    ),
+    "tools": [create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker],
     "model": worker_model
 }
 
@@ -151,10 +213,13 @@ housepadi_agent_graph = create_deep_agent(
     tools=[write_todos],
     system_prompt=SYSTEM_PROMPT,
     backend=tenant_isolated_store,
-    subagents=[property_agent, tour_agent, lease_agent],
+    subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
     interrupt_on={
-        "lease_database_worker": {
+        "evaluate_application_worker": {
             "allowed_decisions": ["approve", "reject"]
+        },
+        "approve_kyc_worker": {
+            "allowed_decisions": ["verified", "rejected"]
         }
     }
 )
