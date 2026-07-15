@@ -30,7 +30,11 @@ ollama run llama3.1:8b
 
 5. Start backend
 ```bash
-python -m uvicorn app.main:app --reload
+# Preferred: use the 'uv' wrapper (install with `pip install uv`)
+uv run app.main:app --reload
+
+# Fallback: use uvicorn directly if 'uv' is not available
+uvicorn app.main:app --reload
 ```
 
 6. Open API docs
