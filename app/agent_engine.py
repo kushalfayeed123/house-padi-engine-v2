@@ -97,7 +97,7 @@ ollama_model = ChatOllama(
     model="llama3.1:8b",
     temperature=0,
     base_url="http://localhost:11434",
-    timeout=30.0
+    client_kwargs={"timeout": 30.0}
 )
 
 # Fallback to OpenRouter free tier if other services are unavailable
@@ -215,12 +215,8 @@ housepadi_agent_graph = create_deep_agent(
     backend=tenant_isolated_store,
     subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
     interrupt_on={
-        "evaluate_application_worker": {
-            "allowed_decisions": ["approve", "reject"]
-        },
-        "approve_kyc_worker": {
-            "allowed_decisions": ["verified", "rejected"]
-        }
+        "evaluate_application_worker": True,
+        "approve_kyc_worker": True
     }
 )
 
