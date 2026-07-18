@@ -31,8 +31,7 @@ ollama run llama3.1:8b
 5. Start backend
 ```bash
 # Preferred: use the 'uv' wrapper (install with `pip install uv`)
-uv run app.main:app --reload
-
+uv run --env-file .env uvicorn app.main:app --host 0.0.0.0 --port 8000  --proxy-headers --reload           
 # Fallback: use uvicorn directly if 'uv' is not available
 uvicorn app.main:app --reload
 ```

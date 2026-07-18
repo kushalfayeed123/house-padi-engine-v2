@@ -1,0 +1,72 @@
+# Supabase Configuration
+
+# Project Configuration
+[project]
+# Your project reference from Supabase dashboard
+# project_ref = "your-project-ref"
+
+# Database Configuration
+[db]
+# Database port (default: 5432)
+port = 5432
+
+# Studio Configuration
+[studio]
+# Studio port for local development (default: 3000)
+port = 3000
+
+# Auth Configuration
+[auth]
+enabled = true
+
+# JWT Secret (generate a strong one for production)
+# jwt_secret = "your-super-secret-jwt-key-change-this"
+
+# External OAuth Providers (optional)
+# [auth.external.google]
+# enabled = false
+# client_id = ""
+# secret = ""
+
+# [auth.external.github]
+# enabled = false
+# client_id = ""
+# secret = ""
+
+# Storage Configuration
+[storage]
+enabled = true
+
+# S3-compatible storage (for file uploads)
+# [storage.s3]
+# access_key = "your-access-key"
+# secret_key = "your-secret-key"
+# region = "us-east-1"
+# bucket = "housepadi"
+# endpoint = "https://your-s3-endpoint.com"
+
+# Vector/Embedding Configuration (optional - for AI features)
+# [vector]
+# enabled = true
+# # Configure your vector database connection
+
+# Realtime Configuration (for live updates)
+[realtime]
+enabled = true
+
+# Analytics Configuration (optional)
+# [analytics]
+# enabled = false
+
+# Email Configuration (optional - for sending notifications)
+# [email]
+# enabled = true
+# smtp_host = "smtp.gmail.com"
+# smtp_port = 587
+# sender_email = "noreply@housepadi.app"
+# sender_name = "HousePadi"
+
+# Webhook Configuration (optional - for external integrations)
+# [webhook]
+# enabled = true
+# signing_secret = "your-webhook-secret"

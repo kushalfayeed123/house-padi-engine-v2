@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from app.database import supabase_client, db
-from app.schemas.payloads import KYCVerificationPayload
 from logging import getLogger
 from datetime import datetime
 

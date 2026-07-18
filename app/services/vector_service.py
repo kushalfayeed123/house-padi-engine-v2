@@ -62,7 +62,7 @@ def vectorize_search_query(query_text: str) -> List[float]:
     """
     model = get_model()
     # Explicitly use encode_query if available or standard encode on raw text
-    embedding = model.encode(query_text.strip())
+    embedding = model.encode(f"query: {query_text.strip()}")
     return embedding.tolist()
 
 

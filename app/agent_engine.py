@@ -1,14 +1,20 @@
 import os
-from typing import Any, List
+import logging
+from typing import Annotated, Any, List, Optional, TypedDict, cast
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import StoreBackend
+from langchain_core.messages import BaseMessage, convert_to_messages
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
-# removed ChatOllama import - local models not required in this deployment
+from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver 
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import add_messages 
 
+from app.intent_transformer import dynamic_intent_router
 from app.tools.property_ops import create_property_worker, search_properties_worker
 from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
 from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
@@ -19,6 +25,10 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field, SecretStr
 
 load_dotenv()
+
+
+class InputAgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
 
 # --- 1. Execution Planner Setup ---
 
@@ -48,7 +58,6 @@ def write_todos(todos: List[Any]) -> str:
 
 # --- 2. Re-enabled Fully Descriptive System Prompt ---
 
-
 SYSTEM_PROMPT = """You are the HousePadi Supervisor Agent. Your job is to orchestrate end-to-end real estate operations by routing requests to specialized sub-agents.
 
 CRITICAL FIRST STEP:
@@ -77,6 +86,13 @@ EXECUTION RULES:
 - USER-FACING PRESENTATION SAFETY: When summarizing for the user, NEVER display raw database UUID strings. Hide them behind natural text or reference numbers.
 - Trust backend worker payloads completely.
 - Use cache hits when possible to reduce API calls (caching enabled for property searches).
+
+CRITICAL ROUTING RULE:
+1. If you require information from the user (e.g., location, price, dates), YOU MUST HALT. 
+2. Ask the user for the missing information. 
+3. DO NOT attempt to call a sub-agent or search tool until the user has provided the required data.
+4. Your ONLY tools are `write_todos` for planning and the specialized sub-agents. 
+   NEVER call worker tools (like search_properties) directly. ALWAYS delegate to the relevant sub-agent.
 """
 
 # --- 3. RATE-LIMIT-OPTIMIZED MULTI-MODEL STRATEGY ---
@@ -93,54 +109,132 @@ groq_model = ChatGroq(
     max_retries=3,  # Built-in retry logic for rate limit handling
 )
 
-ollama_model = ChatOllama(
-    model="llama3.1:8b",
-    temperature=0,
-    base_url="http://localhost:11434",
-    client_kwargs={"timeout": 30.0}
-)
+# ollama_model = ChatOllama(
+#     model="llama3.1:8b",
+#     temperature=0,
+#     base_url="http://localhost:11434",
+#     client_kwargs={"timeout": 30.0}
+# )
 
 # Fallback to OpenRouter free tier if other services are unavailable
-openrouter_fallback = ChatOpenAI(
+openrouter_model = ChatOpenAI(
     model="openrouter/auto",
     base_url="https://openrouter.ai/api/v1",
     api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
     temperature=0,
 )
 
-# SUPERVISOR: Use Groq for routing decisions (very fast, handles rate limits well)
-supervisor_model = groq_model
+# --- 3b. Intelligent Model Selection at Request Time ---
+logger = logging.getLogger(__name__)
 
-# WORKERS: Use Groq as the primary worker model as local models are not available in this environment
-# OpenRouter can act as a tertiary fallback if needed
-worker_model = groq_model
 
-# --- 4. Lightweight Intent Router (reduces token usage) ---
+class ModelSelectorCache:
+    """Caches model availability checks to avoid redundant health checks within a time window."""
 
-@tool("intent_router")
-def intent_router(text: str) -> str:
-    """Lightweight deterministic intent router to avoid expensive LLM calls for simple routing.
-    Uses keyword heuristics to map user intent to one of the specialist agents.
-    Returns the agent name (e.g., 'property-specialist', 'tour-specialist', etc.).
+    def __init__(self, cache_duration_seconds: int=300):
+        self.cache_duration = timedelta(seconds=cache_duration_seconds)
+        self.last_check: dict[str, datetime] = {}
+        self.availability: dict[str, bool] = {}
+    
+    def is_cached(self, model_name: str) -> bool:
+        """Check if cached availability is still valid."""
+        if model_name not in self.last_check:
+            return False
+        return datetime.now() - self.last_check[model_name] < self.cache_duration
+    
+    def get(self, model_name: str) -> Optional[bool]:
+        """Get cached availability status if available."""
+        if self.is_cached(model_name):
+            return self.availability.get(model_name)
+        return None
+    
+    def set(self, model_name: str, available: bool) -> None:
+        """Cache availability status."""
+        self.last_check[model_name] = datetime.now()
+        self.availability[model_name] = available
+
+
+model_cache = ModelSelectorCache(cache_duration_seconds=300)
+
+
+def check_model_availability(model: Any, model_name: str) -> bool:
     """
-    normalized = (text or "").lower()
-    # Simple keyword rules (expand as needed)
-    if any(k in normalized for k in ["search", "find", "list", "show me", "apart", "apartment", "studio", "2-bedroom", "3-bedroom", "property"]):
-        return "property-specialist"
-    if any(k in normalized for k in ["tour", "visit", "schedule", "book", "see the place"]):
-        return "tour-specialist"
-    if any(k in normalized for k in ["lease", "sign", "agreement", "contract", "lease agreement"]):
-        return "lease-specialist"
-    if any(k in normalized for k in ["pay", "payment", "rent", "wallet", "invoice"]):
-        return "payment-specialist"
-    if any(k in normalized for k in ["verify", "kyc", "identity", "id number", "id image"]):
-        return "kyc-specialist"
-    if any(k in normalized for k in ["message", "chat", "contact", "message owner", "message landlord"]):
-        return "chat-specialist"
-    # Fallback: let the supervisor model decide only when heuristics don't match
-    return "supervisor"
+    Test if a model is available by attempting a simple invoke.
+    Returns True if successful, False otherwise.
+    """
+    cached = model_cache.get(model_name)
+    if cached is not None:
+        logger.debug(f"[MODEL_SELECTOR] Using cached availability for {model_name}: {cached}")
+        return cached
+    
+    try:
+        logger.info(f"[MODEL_SELECTOR] Testing availability of {model_name}...")
+        # Simple health check: attempt to invoke with a minimal test message
+        response = model.invoke([{"role": "user", "content": "ping"}])
+        model_cache.set(model_name, True)
+        logger.info(f"[MODEL_SELECTOR] ✓ {model_name} is AVAILABLE")
+        return True
+    except Exception as e:
+        model_cache.set(model_name, False)
+        logger.warning(f"[MODEL_SELECTOR] ✗ {model_name} is UNAVAILABLE: {str(e)[:100]}")
+        return False
+
+
+def select_available_model() -> Any:
+    """
+    Intelligently select an available model using a fallback chain.
+    Priority: Groq (primary) → Ollama (secondary) → OpenRouter (tertiary)
+    Returns the first available model or raises exception if all fail.
+    """
+    logger.info("[MODEL_SELECTOR] Starting model availability check...")
+    
+    models_to_check = [
+        (groq_model, "Groq (llama-3.3-70b-versatile)"),
+        # (ollama_model, "Ollama (llama3.1:8b)"),
+        (openrouter_model, "OpenRouter (openrouter/auto)")
+    ]
+    
+    for model, model_name in models_to_check:
+        if check_model_availability(model, model_name):
+            logger.info(f"[MODEL_SELECTOR] Selected model: {model_name}")
+            return model
+    
+    # All models failed
+    error_msg = (
+        "All models are unavailable. Checked: Groq, Ollama, OpenRouter. "
+        "Ensure at least one model service is running and properly configured."
+    )
+    logger.error(f"[MODEL_SELECTOR] CRITICAL: {error_msg}")
+    raise RuntimeError(error_msg)
+
+
+def get_dynamic_supervisor_model() -> Any:
+    """Get supervisor model with dynamic selection (prioritizes Groq for routing speed)."""
+    try:
+        return select_available_model()
+    except RuntimeError:
+        logger.warning("[MODEL_SELECTOR] Falling back to Groq for supervisor (may fail if unavailable)")
+        return openrouter_model
+
+
+def get_dynamic_worker_model() -> Any:
+    """Get worker model with dynamic selection."""
+    try:
+        return select_available_model()
+    except RuntimeError:
+        logger.warning("[MODEL_SELECTOR] Falling back to Groq for worker (may fail if unavailable)")
+        return openrouter_model
+
+
+# Default models (fallback if dynamic selection fails)
+supervisor_model = openrouter_model
+worker_model = openrouter_model
+
+
+
 
 # --- 4. Sub-Agent Definitions ---
+
 
 property_agent: SubAgent = {
     "name": "property-specialist",
@@ -233,20 +327,75 @@ tenant_isolated_store = StoreBackend(
     )
 )
 
-housepadi_agent_graph = create_deep_agent(
-    model=supervisor_model,
-    tools=[write_todos, intent_router],
-    system_prompt=SYSTEM_PROMPT,
-    backend=tenant_isolated_store,
-    subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
-    interrupt_on={
-        "evaluate_application_worker": True,
-        "approve_kyc_worker": True
-    }
-)
 
-# Attach fallback model reference so runtime can use it if primary Groq becomes unreachable.
-# This doesn't change create_deep_agent internals but exposes an attribute the runner can consult.
-housepadi_agent_graph.fallback_model = openrouter_fallback
 
-housepadi_agent_graph.checkpointer = MemorySaver()
+# --- 6. Dynamic Graph Invocation with Model Fallback ---
+
+
+def create_graph_with_selected_model():
+    """
+    Create a fresh graph instance with the currently available model.
+    Called at runtime to ensure the graph uses a working model.
+    """
+    selected_supervisor = get_dynamic_supervisor_model()
+    
+    logger.info(f"[GRAPH_FACTORY] Creating agent graph with supervisor model: {selected_supervisor.model}")
+    
+    graph = create_deep_agent(
+        model=selected_supervisor,
+        tools=[write_todos],
+        system_prompt=SYSTEM_PROMPT,
+        backend=tenant_isolated_store,
+        subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
+        interrupt_on={
+            "evaluate_application_worker": True,
+            "approve_kyc_worker": True
+        }
+    )
+    graph.checkpointer = MemorySaver()
+    return graph
+
+
+async def invoke_housepadi_agent(
+    messages: List[dict],
+    thread_id: Optional[str]=None
+) -> dict:
+    """
+    Invoke the HousePadi agent graph with intelligent model fallback.
+    
+    Args:
+        messages: Input message(s) to the agent
+        config: Optional configuration (e.g., for routing, debugging)
+        thread_id: Optional thread ID for multi-turn conversations
+    
+    Returns:
+        Graph invocation result containing agent responses
+    
+    Raises:
+        RuntimeError: If all model backends are unavailable
+    """
+    try:
+        logger.info("[INVOKE] Starting agent invocation with dynamic model selection...")
+        for msg in messages:
+            logger.info(f"DEBUG_HISTORY: {msg.get('role')}: {msg.get('content')}")
+        converted_messages = convert_to_messages(messages)
+        state_dict: InputAgentState = {"messages": converted_messages}
+        invocation_config: RunnableConfig  = {"configurable": {"thread_id": thread_id}} if thread_id else {}
+        graph = create_graph_with_selected_model()
+       
+        
+        result = await graph.ainvoke(
+            input=cast(Any, state_dict),
+            config=invocation_config
+        )
+        
+        logger.info(f"[INVOKE] Agent completed successfully with {graph} model")
+        return result
+    
+    except Exception as e:
+        logger.error(f"[INVOKE] Agent invocation failed: {str(e)}")
+        raise
+
+# --- 7. Backward Compatibility: Static Graph for Legacy Code ---
+# Keep the pre-compiled graph for any existing direct invocations
+# (This will use the default supervisor_model = groq_model)

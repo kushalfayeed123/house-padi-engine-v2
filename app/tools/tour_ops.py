@@ -1,9 +1,9 @@
 import json
+from typing import Optional
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from app.database import supabase_client, db
-from app.schemas.payloads import TourPayload
 from logging import getLogger
 
 logger = getLogger("uvicorn")
@@ -14,7 +14,8 @@ class BookTourInput(BaseModel):
     tour_date: str = Field(..., description="The preferred ISO timestamp format (YYYY-MM-DD HH:MM:SS) for the tour appointment.")
 
 
-def generate_google_maps_link(latitude: float, longitude: float, address: str) -> str:
+def generate_google_maps_link(latitude: Optional[float], 
+    longitude: Optional[float], address: str) -> str:
     """Generate a Google Maps link for property directions."""
     if not latitude or not longitude:
         return f"https://www.google.com/maps/search/{address.replace(' ', '+')}"

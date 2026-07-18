@@ -4,7 +4,6 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from app.database import supabase_client, db
-from app.schemas.payloads import LeasePayload, ApplicationPayload
 from logging import getLogger
 from datetime import datetime
 from uuid import UUID
