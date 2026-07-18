@@ -17,8 +17,8 @@ async def chat_endpoint(body: ChatRequest):
             return ChatResponse(
                 status="success",
                 type="redirect",
-                response=service_result["redirect_url"],
-                message="Redirecting..."
+                response='Redirecting...',
+                redirect_url=service_result["redirect_url"]
             )
             
         # Handle Chat Response Path
