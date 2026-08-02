@@ -7,7 +7,7 @@ from typing import Annotated, cast
 from logging import getLogger
 
 from langchain_core.tools import BaseTool
-from app.dependecies import get_user_context
+from app.dependecies import get_optional_user_context
 from app.models.property import PropertySchema
 from app.tools.property_ops import create_property_worker, get_featured_worker, get_landlord_properties_worker, get_property_details_worker, update_property_worker
 
@@ -16,7 +16,7 @@ logger = getLogger("uvicorn")
 router = APIRouter(prefix="/api/property")
 
 @router.post("/create")
-async def create_property(data: PropertySchema, context: dict = Depends(get_user_context)):
+async def create_property(data: PropertySchema, context: dict = Depends(get_optional_user_context)):
     tool = cast(BaseTool, create_property_worker)
     result = await tool.ainvoke(
         data.dict(), 
@@ -25,7 +25,7 @@ async def create_property(data: PropertySchema, context: dict = Depends(get_user
     return {"status": "success", "message": result}
 
 @router.get("/landlord/listings")
-async def get_my_listings(context: dict = Depends(get_user_context)):
+async def get_my_listings(context: dict = Depends(get_optional_user_context)):
     tool = cast(BaseTool, get_landlord_properties_worker)
     result = await tool.ainvoke({}, config={"configurable": {"user_id": context["id"], "user_role": context["role"]}})
     
@@ -47,7 +47,7 @@ async def get_details(id: str):
     return json.loads(res)
 
 @router.patch("/{id}")
-async def update_property(id: str, update_data: dict, context: dict = Depends(get_user_context)):
+async def update_property(id: str, update_data: dict, context: dict = Depends(get_optional_user_context)):
     tool = cast(BaseTool, update_property_worker)
     res = await tool.ainvoke(
         {"property_id": id, "update_data": update_data},

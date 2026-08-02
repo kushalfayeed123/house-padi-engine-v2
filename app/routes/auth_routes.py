@@ -1,7 +1,13 @@
+import json
+
 from fastapi import APIRouter, HTTPException, status, Request
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
 from pydantic import BaseModel, EmailStr
-from typing import Literal
+from typing import Literal, cast
 from logging import getLogger
+
+from app.tools.profile_ops import get_user_profile_worker
 
 logger = getLogger("uvicorn")
 
@@ -71,25 +77,50 @@ async def register_user(body: RegisterRequest, request: Request):
             detail=f"Registration request execution failed: {error_msg}"
         )
 
+
+
 @router.post("/login")
 async def login_user(body: AuthCredentials, request: Request):
     supabase = request.app.state.system.supabase
     try:
+        # 1. Authenticate user via Supabase Auth
         auth_response = supabase.auth.sign_in_with_password({
             "email": body.email,
             "password": body.password
         })
         
+        user_id = auth_response.user.id
+
+        # 2. Invoke the profile tool programmatically using RunnableConfig
+        config: RunnableConfig = {
+            "configurable": {
+                "user_id": user_id
+            }
+        }
+        
+        # Tool expects an input (empty dict for GetUserProfileInput) and a config
+        tool = cast(BaseTool, get_user_profile_worker)
+        tool_output_str = await tool.ainvoke({}, config=config)
+        
+        # 3. Parse the JSON string returned by the tool
+        try:
+            profile_data = json.loads(tool_output_str)
+        except Exception:
+            profile_data = {"raw_output": tool_output_str}
+
+        # 4. Return tokens, auth metadata, and the tool-fetched profile
         return {
             "access_token": auth_response.session.access_token,
             "refresh_token": auth_response.session.refresh_token,
             "user": {
-                "id": auth_response.user.id,
+                "id": user_id,
                 "email": auth_response.user.email,
                 "user_metadata": auth_response.user.user_metadata,
-                "identities": auth_response.user.identities
+                "identities": auth_response.user.identities,
+                "profile": profile_data
             }
         }
+        
     except Exception as e:
         error_msg = str(e).lower()
         if "timeout" in error_msg or "handshake" in error_msg:
@@ -99,8 +130,6 @@ async def login_user(body: AuthCredentials, request: Request):
             )
             
         raise HTTPException(status_code=401, detail="Invalid email or password.")
-    
-    
     
     
     

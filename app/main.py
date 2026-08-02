@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 # Import your routes
-from app.routes import auth_routes, property_routes, chat_routes
+from app.routes import auth_routes, profile_routes, property_routes, chat_routes
 # Import model loader
 from app.services.vector_service import get_model
 
@@ -77,6 +77,7 @@ app.add_middleware(
 app.include_router(auth_routes.router)
 app.include_router(property_routes.router)
 app.include_router(chat_routes.router)
+app.include_router(profile_routes.router)
 
 
 @app.get("/")
