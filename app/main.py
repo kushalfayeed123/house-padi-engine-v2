@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from logging import getLogger
@@ -10,6 +11,7 @@ from supabase import create_client, Client
 # Import your routes
 from app.routes import auth_routes, profile_routes, property_routes, chat_routes
 # Import model loader
+from app.services import property_cron
 from app.services.vector_service import get_model
 
 logger = getLogger("uvicorn")
@@ -20,6 +22,7 @@ class SystemStateContainer:
 
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
+
 
 
 # 2. Define Lifespan
@@ -39,14 +42,26 @@ async def lifespan(app: FastAPI):
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-    if not supabase_url or not supabase_key:
-        logger.error("CRITICAL CONFIG ERROR: Missing SUPABASE_URL or SUPABASE_KEY.")
-        supabase_url = "https://placeholder-url.supabase.co"
-        supabase_key = "placeholder-anon-key"
-
     logger.info("Initializing persistent Supabase Client...")
-    supabase_client = create_client(supabase_url, supabase_key)
-    app.state.system = SystemStateContainer(supabase_client=supabase_client)
+
+    if supabase_url and supabase_key:
+        supabase_client = create_client(supabase_url, supabase_key)
+        # Bind it to app.state.system to match your dependencies.py
+        app.state.system = SystemStateContainer(supabase_client)
+        app.state.supabase = supabase_client
+
+
+    sweep_task = asyncio.create_task(property_cron.run_pending_property_enrichment_sweep())
+    
+    yield  # This separates startup from shutdown
+    
+    # --- SHUTDOWN ACTIONS ---
+    # Gracefully cancel the background loop when the app stops
+    sweep_task.cancel()
+    try:
+        await sweep_task
+    except asyncio.CancelledError:
+        pass
 
     logger.info("Pre-warming semantic model memory...")
     get_model()
@@ -87,3 +102,5 @@ async def root_health_check():
         "service": "HousePadi Backend Engine",
         "version": "1.0.0"
     }
+
+

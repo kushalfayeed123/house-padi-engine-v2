@@ -21,13 +21,21 @@ import os
 from typing import Optional
 import uuid
 
+from app.intent_transformer import dynamic_intent_router
 from app.services.chat_persistence import load_thread_history_from_db, save_message_to_db
 from app.services.lightweight_agent import invoke_lightweight_agent
 from app.services.token_budget import trim_conversation_history
+from app.ui_registry import INTENT_UI_MAP
+from app.ui_registry import INTENT_UI_MAP
 
 logger = logging.getLogger("uvicorn")
 
 AGENT_BACKEND = os.getenv("AGENT_BACKEND", "lightweight").strip().lower()
+INTENT_CONTENT_MAP = {
+    "TRIGGER_PROPERTY_UI": "Opening the property listing form for you...",
+    "TRIGGER_PAYMENT_UI": "Taking you to your payments page...",
+    "TRIGGER_KYC_UI": "Opening identity verification..."
+}
 
 
 def _get_multi_agent_invoker():
@@ -44,17 +52,31 @@ async def process_chat_message(
     thread_id: Optional[str] = None,
     user_context: Optional[dict] = None,
 ) -> dict:
-    # Generate a stable thread ID if none is provided by the client
     if not thread_id:
         thread_id = str(uuid.uuid4())
 
     user_id = user_context.get("user_id") if user_context else None
     user_role = user_context.get("role") if user_context else "renter"
-
-    # 1. Load multi-turn conversation history from Supabase tables
-    raw_history = await load_thread_history_from_db(thread_id)
     
-    # 2. Append the new incoming user message to history
+    # 1. Dynamically check if detected intent maps to a UI route
+    detected_intent = dynamic_intent_router(message)
+    if detected_intent in INTENT_UI_MAP:
+        await save_message_to_db(thread_id=thread_id, content=message, is_ai_response=False, sender_id=user_id)
+        
+        target_url = INTENT_UI_MAP[detected_intent]
+        response_content = INTENT_CONTENT_MAP.get(detected_intent, "Redirecting...")
+        
+        redirect_payload = {
+            "type": "redirect",
+            "content": response_content,
+            "redirect_url": target_url
+        }
+        
+        await save_message_to_db(thread_id=thread_id, content=response_content, is_ai_response=True)
+        return redirect_payload
+
+    # 2. Load multi-turn conversation history from Supabase tables
+    raw_history = await load_thread_history_from_db(thread_id)
     raw_history.append({"role": "user", "content": message})
 
     # 3. Persist incoming user message to the 'messages' table
@@ -70,7 +92,6 @@ async def process_chat_message(
     # 4. Trim history to fit token budget constraints
     trimmed_messages = trim_conversation_history(raw_history, max_tokens=4000)
 
-    # Convert LangChain BaseMessages back to List[dict] for the agent backend
     role_mapping = {"human": "user", "ai": "assistant", "tool": "tool", "system": "system"}
     agent_messages = [
         {
@@ -105,20 +126,11 @@ async def process_chat_message(
 
 
 def _normalize_agent_output(raw_result: dict) -> dict:
-    """
-    Both backends return {"messages": [...]} (a LangChain message list).
-    Reduce that down to what chat_routes.py / ChatResponse expects:
-    {"type": "response"|"redirect", "content": str, "data": list|None, "redirect_url": str|None}
-    """
     msgs = raw_result.get("messages", [])
-
     data = None
     redirect_url = None
     content = None
 
-    # Scan tool results for structured payloads: a JSON list is treated as
-    # search results (surfaced to the frontend as `data`); a JSON object
-    # with a redirect_url key triggers a redirect response.
     for m in msgs:
         m_type = getattr(m, "type", None)
         m_content = getattr(m, "content", None)
@@ -133,8 +145,6 @@ def _normalize_agent_output(raw_result: dict) -> dict:
         elif isinstance(parsed, dict) and "redirect_url" in parsed:
             redirect_url = parsed["redirect_url"]
 
-    # Last AI message is the natural-language reply, if the backend
-    # produced one (the fast path doesn't — see fallback below).
     for m in reversed(msgs):
         if getattr(m, "type", None) == "ai" and getattr(m, "content", None):
             content = m.content

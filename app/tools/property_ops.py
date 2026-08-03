@@ -32,7 +32,7 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
         "base_price": base_price,
         "bedrooms": bedrooms,
     }
-    # cache_invalidate("property_search")  # Invalidate old cache entries for search
+    cache_invalidate("property_search")  # Invalidate old cache entries for search
     cache_key = _generate_cache_key("property_search", cache_payload)
 
     cached_result = cache_get(cache_key)
@@ -59,8 +59,8 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
                 },
                 "lat": None,
                 "lng": None,
-                "radius_km": 5, # e.g., 5
-                "tags": [] # List of strings, e.g., ["pool", "furnished"]
+                "radius_km": 5,
+                "tags": []
             }).execute()
         )
 
@@ -387,3 +387,11 @@ async def update_property_worker(property_id: str, update_data: Dict[str, Any], 
     except Exception as e:
         logger.error(f"[UPDATE ERROR] {str(e)}")
         return f"Database error during update: {str(e)}"
+    
+    
+@tool("trigger_property_ui_worker")
+async def trigger_property_ui_worker() -> str:
+    """Triggered when a user wants to create a new property or list a home."""
+    return json.dumps({
+        "redirect_url": "/landlord/properties/new"
+    })

@@ -31,7 +31,7 @@ from pydantic import SecretStr
 
 from app.services.token_budget import trim_conversation_history, budget_for_model
 
-from app.tools.property_ops import create_property_worker, search_properties_worker
+from app.tools.property_ops import create_property_worker, search_properties_worker, trigger_property_ui_worker
 from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
 from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
 from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
@@ -59,7 +59,7 @@ CONVERSATION GUIDELINES:
 # --- Tool Groupings ---
 
 SEARCH_TOUR_TOOLS = [
-    search_properties_worker, book_tour_worker, list_tours_worker, approve_tour_worker
+    search_properties_worker, book_tour_worker, list_tours_worker, approve_tour_worker, trigger_property_ui_worker
 ]
 LEASE_PAY_TOOLS = [
     create_lease_worker, sign_lease_worker, evaluate_application_worker,
