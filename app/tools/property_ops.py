@@ -4,7 +4,7 @@ import asyncio
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from app.database import supabase_client, db
-from app.services.cache_service import cache_get, cache_invalidate, cache_set
+from app.services.cache_service import _generate_cache_key, cache_get, cache_invalidate, cache_set
 from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query
 from pydantic import BaseModel, Field, field_validator
 from logging import getLogger
@@ -23,31 +23,51 @@ class SearchPropertiesInput(BaseModel):
 
 
 @tool("search_properties_worker")
-async def search_properties_worker(location: str, base_price: Optional[float]=None, bedrooms: Optional[int]=None) -> str:
+async def search_properties_worker(location: str, base_price: Optional[float] = None, bedrooms: Optional[int] = None) -> str:
     """Finds properties matching location and filter criteria."""
-    
+
+    # === CACHE CHECK (avoid redundant embedding + RPC calls) ===
+    cache_payload = {
+        "location": (location or "").strip().lower(),
+        "base_price": base_price,
+        "bedrooms": bedrooms,
+    }
+    # cache_invalidate("property_search")  # Invalidate old cache entries for search
+    cache_key = _generate_cache_key("property_search", cache_payload)
+
+    cached_result = cache_get(cache_key)
+    if cached_result:
+        logger.info(f"[CACHE HIT] search_properties_worker: {location}")
+        return cached_result
+
     # 1. Vectorize query
-    query_vector = await asyncio.to_thread(vectorize_search_query, location)
-    print(query_vector)
+    query_vector = await asyncio.to_thread(vectorize_search_query, location, bedrooms)
 
     # 2. Call Supabase RPC
     try:
         res = await asyncio.to_thread(
-            supabase_client.rpc("match_properties", {
-                "query_embedding": query_vector,
-                "match_threshold": 0.2,
-                "match_count": 5,
+            lambda: supabase_client.rpc("match_properties", {
+                "query_embedding": query_vector, # List of floats from your embedding model (or None)
+                "match_threshold": 0.25,
+                "match_count": 20,
                 "filter_owner_id": None,
                 "budget_limit": base_price,
-                "filters": {"bedrooms": str(bedrooms) if bedrooms else None}
-            }).execute
+                "filters": {
+                    "bedrooms": bedrooms,
+                    "location": location,
+                    "status": "available"
+                },
+                "lat": None,
+                "lng": None,
+                "radius_km": 5, # e.g., 5
+                "tags": [] # List of strings, e.g., ["pool", "furnished"]
+            }).execute()
         )
-        
-        print(res)
-        
-        # 3. Handle data/Type safety
+
         if not res.data or not isinstance(res.data, list):
-            return json.dumps([])
+            empty_result = json.dumps([])
+            cache_set(cache_key, empty_result, ttl_hours=1)
+            return empty_result
 
         sanitized = [{
             "id": item.get("id"),
@@ -58,13 +78,17 @@ async def search_properties_worker(location: str, base_price: Optional[float]=No
             "bedrooms": item.get("bedrooms"),
             "bathrooms": item.get("bathrooms"),
             "amenities": item.get("amenities"),
-            "images": item.get("images", []),  # Capture the list of image URLs
+            "images": item.get("images", []),
             "similarity": item.get("similarity")
         } for item in res.data if isinstance(item, dict)]
 
-        return json.dumps(sanitized)
-        
+        result = json.dumps(sanitized)
+        # Listings shift throughout the day — short TTL, not the 24h default
+        cache_set(cache_key, result, ttl_hours=1)
+        return result
+
     except Exception as e:
+        # Don't cache errors — a transient RPC failure shouldn't get "stuck"
         return json.dumps({"error": str(e)})
 
 

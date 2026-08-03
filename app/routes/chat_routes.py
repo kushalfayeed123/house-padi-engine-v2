@@ -14,7 +14,7 @@ async def chat_endpoint(
     context: Optional[dict] = Depends(get_optional_user_context)
 ):
     try:
-        service_result = await process_chat_message(body.message, body.thread_id)
+        service_result = await process_chat_message(body.message, body.thread_id, context)
         
         # Handle Redirect Path
         if service_result["type"] == "redirect":

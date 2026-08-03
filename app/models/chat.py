@@ -14,5 +14,5 @@ class ChatResponse(BaseModel):
     message: Optional[str] = None
     response: Optional[str] = None  # Make optional
     redirect_url: Optional[str] = None  # Make optional
-    data: Optional[Dict[str, Any]] = None  # Make optional
+    data: Optional[Any] = None  # Make optional
 

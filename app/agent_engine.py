@@ -6,15 +6,12 @@ from dotenv import load_dotenv
 
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import StoreBackend
-from langchain_core.messages import BaseMessage, convert_to_messages
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import add_messages 
 
-from app.intent_transformer import dynamic_intent_router
 from app.tools.property_ops import create_property_worker, search_properties_worker
 from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
 from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
@@ -23,6 +20,8 @@ from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_
 from app.tools.chat_ops import create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field, SecretStr
+
+from app.services.token_budget import trim_conversation_history, budget_for_model
 
 load_dotenv()
 
@@ -58,41 +57,33 @@ def write_todos(todos: List[Any]) -> str:
 
 # --- 2. Re-enabled Fully Descriptive System Prompt ---
 
-SYSTEM_PROMPT = """You are the HousePadi Supervisor Agent. Your job is to orchestrate end-to-end real estate operations by routing requests to specialized sub-agents.
+SYSTEM_PROMPT = """You are the HousePadi Supervisor Agent.
 
-CRITICAL FIRST STEP:
-Before executing any external sub-agent operations, you must immediately call the `write_todos` tool to declare or update your structural task checklist.
+Route real estate requests to specialized sub-agents — never call worker tools directly.
 
-CRITICAL DEPENDENCY & ID LOOKUP RULE:
-1. When a user requests to book a tour or view a property (e.g., "Schedule a tour for the 2-bedroom apartment"), you NEVER guess or fabricate a placeholder UUID for the `property_id`.
-2. You MUST first route the user to the `property-specialist` to perform a search and find the real property record. 
-3. Once the `property-specialist` returns the valid property data payload containing the real `id`, you may then update your checklist and delegate to the `tour-specialist` using that exact real UUID string.
+FIRST STEP: Call `write_todos` before any sub-agent delegation.
 
-ORCHESTRATION & ROUTING PATHWAYS:
-1. PROPERTY OPERATIONS (property-specialist): Handles searching/finding listings for renters and creating new properties for landlords.
-2. TOUR MANAGEMENT (tour-specialist): Schedules tours, generates directions via Google Maps, manages tour approvals.
-3. LEASE WORKFLOWS (lease-specialist): Handles lease creation, signing, and application evaluation with AI screening.
-4. PAYMENT PROCESSING (payment-specialist): Processes rent payments, splits fees between parties, manages wallets.
-5. IDENTITY VERIFICATION (kyc-specialist): Manages KYC verification for renters and landlords.
-6. MESSAGING (chat-specialist): Handles communication between renters, landlords, and property owners.
+ID LOOKUP RULE: Never fabricate a `property_id` UUID. For tours/viewings, route to `property-specialist` first to get the real `id`, then delegate to `tour-specialist` with that exact UUID.
 
-WORKFLOW SEQUENCE (Default User Journey):
-1. Renter: Search for properties → Book tour (with directions) → View applications/approvals → Sign lease → Make payment
-2. Landlord: Create property → Receive tour requests → Evaluate applications → Create lease → Receive payments
+SUB-AGENTS:
+- property-specialist: search listings (renters), create listings (landlords)
+- tour-specialist: schedule/list/approve tours, directions
+- lease-specialist: create/sign leases, evaluate applications
+- payment-specialist: process payments, wallets, fee splits
+- kyc-specialist: identity verification
+- chat-specialist: messaging between users
 
-EXECUTION RULES:
-- Trigger exactly ONE tool per conversational turn. Do not generate parallel tool calls.
-- Always use real UUIDs retrieved from database queries. Never fabricate IDs.
-- USER-FACING PRESENTATION SAFETY: When summarizing for the user, NEVER display raw database UUID strings. Hide them behind natural text or reference numbers.
-- Trust backend worker payloads completely.
-- Use cache hits when possible to reduce API calls (caching enabled for property searches).
+DEFAULT JOURNEYS:
+- Renter: search → tour → apply → sign lease → pay
+- Landlord: list property → tours → evaluate applications → lease → get paid
 
-CRITICAL ROUTING RULE:
-1. If you require information from the user (e.g., location, price, dates), YOU MUST HALT. 
-2. Ask the user for the missing information. 
-3. DO NOT attempt to call a sub-agent or search tool until the user has provided the required data.
-4. Your ONLY tools are `write_todos` for planning and the specialized sub-agents. 
-   NEVER call worker tools (like search_properties) directly. ALWAYS delegate to the relevant sub-agent.
+RULES:
+- One tool call per turn, no parallel calls.
+- Only real UUIDs from database queries — never fabricate.
+- Never show raw UUIDs to the user; use natural references instead.
+- Trust worker payloads as final.
+- If required info (location, price, dates) is missing, STOP and ask the user — do not call a sub-agent until you have it.
+- Your only tools are `write_todos` and the sub-agents.
 """
 
 # --- 3. RATE-LIMIT-OPTIMIZED MULTI-MODEL STRATEGY ---
@@ -102,27 +93,24 @@ CRITICAL ROUTING RULE:
 # - Tertiary: OpenRouter free models (backup fallback)
 # No token-based rate limits. All free. No additional costs.
 
-groq_model = ChatGroq(
+groq_model_supervisor = ChatGroq(
     model="llama-3.3-70b-versatile",
     api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
     temperature=0,
-    max_retries=3,  # Built-in retry logic for rate limit handling
+    max_retries=3,
+    model_kwargs={"parallel_tool_calls": False}
 )
-
-# ollama_model = ChatOllama(
-#     model="llama3.1:8b",
-#     temperature=0,
-#     base_url="http://localhost:11434",
-#     client_kwargs={"timeout": 30.0}
-# )
-
-# Fallback to OpenRouter free tier if other services are unavailable
-openrouter_model = ChatOpenAI(
-    model="openrouter/auto",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
+groq_model = ChatGroq(
+    model="llama-3.1-8b-instant",
+    api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
     temperature=0,
+    max_retries=3,
+    model_kwargs={"parallel_tool_calls": False}
 )
+
+
+
+
 
 # --- 3b. Intelligent Model Selection at Request Time ---
 logger = logging.getLogger(__name__)
@@ -157,93 +145,21 @@ class ModelSelectorCache:
 model_cache = ModelSelectorCache(cache_duration_seconds=300)
 
 
-def check_model_availability(model: Any, model_name: str) -> bool:
-    """
-    Test if a model is available by attempting a simple invoke.
-    Returns True if successful, False otherwise.
-    """
-    cached = model_cache.get(model_name)
-    if cached is not None:
-        logger.debug(f"[MODEL_SELECTOR] Using cached availability for {model_name}: {cached}")
-        return cached
-    
-    try:
-        logger.info(f"[MODEL_SELECTOR] Testing availability of {model_name}...")
-        # Simple health check: attempt to invoke with a minimal test message
-        response = model.invoke([{"role": "user", "content": "ping"}])
-        model_cache.set(model_name, True)
-        logger.info(f"[MODEL_SELECTOR] ✓ {model_name} is AVAILABLE")
-        return True
-    except Exception as e:
-        model_cache.set(model_name, False)
-        logger.warning(f"[MODEL_SELECTOR] ✗ {model_name} is UNAVAILABLE: {str(e)[:100]}")
-        return False
-
-
-def select_available_model() -> Any:
-    """
-    Intelligently select an available model using a fallback chain.
-    Priority: Groq (primary) → Ollama (secondary) → OpenRouter (tertiary)
-    Returns the first available model or raises exception if all fail.
-    """
-    logger.info("[MODEL_SELECTOR] Starting model availability check...")
-    
-    models_to_check = [
-        (groq_model, "Groq (llama-3.3-70b-versatile)"),
-        # (ollama_model, "Ollama (llama3.1:8b)"),
-        (openrouter_model, "OpenRouter (openrouter/auto)")
-    ]
-    
-    for model, model_name in models_to_check:
-        if check_model_availability(model, model_name):
-            logger.info(f"[MODEL_SELECTOR] Selected model: {model_name}")
-            return model
-    
-    # All models failed
-    error_msg = (
-        "All models are unavailable. Checked: Groq, Ollama, OpenRouter. "
-        "Ensure at least one model service is running and properly configured."
-    )
-    logger.error(f"[MODEL_SELECTOR] CRITICAL: {error_msg}")
-    raise RuntimeError(error_msg)
-
-
-def get_dynamic_supervisor_model() -> Any:
-    """Get supervisor model with dynamic selection (prioritizes Groq for routing speed)."""
-    try:
-        return select_available_model()
-    except RuntimeError:
-        logger.warning("[MODEL_SELECTOR] Falling back to Groq for supervisor (may fail if unavailable)")
-        return openrouter_model
-
-
-def get_dynamic_worker_model() -> Any:
-    """Get worker model with dynamic selection."""
-    try:
-        return select_available_model()
-    except RuntimeError:
-        logger.warning("[MODEL_SELECTOR] Falling back to Groq for worker (may fail if unavailable)")
-        return openrouter_model
-
-
-# Default models (fallback if dynamic selection fails)
-supervisor_model = openrouter_model
-worker_model = openrouter_model
-
-
-
-
 # --- 4. Sub-Agent Definitions ---
-
+# NOTE: `description` fields are exposed to the SUPERVISOR as part of each
+# sub-agent's tool schema, and are therefore paid as fixed overhead on
+# *every* supervisor turn regardless of conversation length. Kept terse for
+# that reason. `system_prompt` fields only cost tokens when that specific
+# sub-agent is actually invoked, so they can stay fuller.
 
 property_agent: SubAgent = {
     "name": "property-specialist",
-    "description": (
-        "Handles real estate repository operations, including searching/finding available "
-        "listings for renters, and cataloging/creating new property assets for owners."
-    ),
+    "description": "Search listings for renters; create listings for landlords.",
     "system_prompt": (
        "You are a strict property operations expert for HousePadi.\n\n"
+        "CRITICAL FIELD MAPPING: `location` is a place name only (e.g. 'Lekki Phase 1'), "
+        "never a full description. Bedroom count goes in `bedrooms`, budget in `base_price`. "
+        "Never combine these into one field.\n\n"
         "CRITICAL FOR ENTRY/CREATION WORKFLOWS:\n"
         "If a landlord/owner wants to create or catalog a new property listing, you MUST explicitly "
         "have the actual 'address', 'base_price', and 'location' from their message text.\n"
@@ -255,12 +171,12 @@ property_agent: SubAgent = {
         "You are permitted exactly ONE tool call per turn. Once you receive the tool payload, accept it as final truth and summarize it."
     ),
     "tools": [search_properties_worker, create_property_worker],
-    "model": worker_model  
+    "model": groq_model  
 }
 
 tour_agent: SubAgent = {
     "name": "tour-specialist",
-    "description": "Manages scheduling, booking arrangements, and records regarding physical apartment tours.",
+    "description": "Schedule, list, and approve property tours.",
     "system_prompt": (
         "You are a dedicated tour scheduling assistant for HousePadi.\n"
         "Use `book_tour_worker` when a renter wants to set up a new visitation appointment, "
@@ -268,55 +184,55 @@ tour_agent: SubAgent = {
         "and use `approve_tour_worker` when a landlord approves a tour request."
     ),
     "tools": [book_tour_worker, list_tours_worker, approve_tour_worker],
-    "model": worker_model
+    "model": groq_model
 }
 
 lease_agent: SubAgent = {
     "name": "lease-specialist",
-    "description": "Processes lease applications and approval workflows.",
+    "description": "Create leases, handle signing, evaluate applications.",
     "system_prompt": (
         "You are a lease compliance expert. Handle lease creation, signing, and application evaluation.\n"
         "Use `create_lease_worker` to create lease agreements, `sign_lease_worker` to sign them, "
         "and `evaluate_application_worker` to approve or reject rental applications with AI screening."
     ),
     "tools": [create_lease_worker, sign_lease_worker, evaluate_application_worker],
-    "model": worker_model
+    "model": groq_model
 }
 
 payment_agent: SubAgent = {
     "name": "payment-specialist",
-    "description": "Handles payment processing, fee splitting, and wallet management.",
+    "description": "Process payments, check wallets, split fees.",
     "system_prompt": (
         "You are a payment processing expert for HousePadi.\n"
         "Use `process_payment_worker` to process rent payments, `get_wallet_balance_worker` to check balances, "
         "and `split_payment_worker` to distribute payments between landlords and platform."
     ),
     "tools": [process_payment_worker, get_wallet_balance_worker, split_payment_worker],
-    "model": worker_model
+    "model": groq_model
 }
 
 kyc_agent: SubAgent = {
     "name": "kyc-specialist",
-    "description": "Handles identity verification and user screening.",
+    "description": "Handle identity verification and screening.",
     "system_prompt": (
         "You are an identity verification expert for HousePadi.\n"
         "Use `submit_kyc_worker` to help users submit KYC documents, `get_kyc_status_worker` to check status, "
         "and `approve_kyc_worker` (admin only) to verify or reject applications."
     ),
     "tools": [submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker],
-    "model": worker_model
+    "model": groq_model
 }
 
 chat_agent: SubAgent = {
     "name": "chat-specialist",
-    "description": "Handles messaging between renters, landlords, and property owners.",
+    "description": "Handle messaging between users.",
     "system_prompt": (
         "You are a messaging specialist for HousePadi.\n"
         "Use `create_chat_thread_worker` to start new conversations, `send_message_worker` to send messages, "
         "`get_messages_worker` to retrieve message history, and `list_threads_worker` to show all conversations."
     ),
     "tools": [create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker],
-    "model": worker_model
+    "model": groq_model
 }
 
 # --- 5. State Storage & Graph Compilation ---
@@ -337,12 +253,11 @@ def create_graph_with_selected_model():
     Create a fresh graph instance with the currently available model.
     Called at runtime to ensure the graph uses a working model.
     """
-    selected_supervisor = get_dynamic_supervisor_model()
     
-    logger.info(f"[GRAPH_FACTORY] Creating agent graph with supervisor model: {selected_supervisor.model}")
+    logger.info(f"[GRAPH_FACTORY] Creating agent graph with supervisor model: {groq_model_supervisor.model}")
     
     graph = create_deep_agent(
-        model=selected_supervisor,
+        model=groq_model_supervisor,
         tools=[write_todos],
         system_prompt=SYSTEM_PROMPT,
         backend=tenant_isolated_store,
@@ -358,44 +273,46 @@ def create_graph_with_selected_model():
 
 async def invoke_housepadi_agent(
     messages: List[dict],
-    thread_id: Optional[str]=None
+    thread_id: Optional[str] = None,
+    user_context: Optional[dict] = None,
 ) -> dict:
-    """
-    Invoke the HousePadi agent graph with intelligent model fallback.
-    
-    Args:
-        messages: Input message(s) to the agent
-        config: Optional configuration (e.g., for routing, debugging)
-        thread_id: Optional thread ID for multi-turn conversations
-    
-    Returns:
-        Graph invocation result containing agent responses
-    
-    Raises:
-        RuntimeError: If all model backends are unavailable
-    """
-    try:
-        logger.info("[INVOKE] Starting agent invocation with dynamic model selection...")
-        for msg in messages:
-            logger.info(f"DEBUG_HISTORY: {msg.get('role')}: {msg.get('content')}")
-        converted_messages = convert_to_messages(messages)
-        state_dict: InputAgentState = {"messages": converted_messages}
-        invocation_config: RunnableConfig  = {"configurable": {"thread_id": thread_id}} if thread_id else {}
-        graph = create_graph_with_selected_model()
-       
-        
-        result = await graph.ainvoke(
-            input=cast(Any, state_dict),
-            config=invocation_config
-        )
-        
-        logger.info(f"[INVOKE] Agent completed successfully with {graph} model")
-        return result
-    
-    except Exception as e:
-        logger.error(f"[INVOKE] Agent invocation failed: {str(e)}")
-        raise
+    # Start from the tightest ceiling in the pipeline (the sub-agent worker
+    # model), since a request that fits the supervisor can still blow up
+    # once delegated to a sub-agent carrying its own tool schemas.
+    budget = budget_for_model("llama-3.1-8b-instant")
+    invocation_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": (user_context or {}).get("id"),
+            "user_role": (user_context or {}).get("role", "renter"),
+        }
+    }
+    graph = create_graph_with_selected_model()
 
-# --- 7. Backward Compatibility: Static Graph for Legacy Code ---
-# Keep the pre-compiled graph for any existing direct invocations
-# (This will use the default supervisor_model = groq_model)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            converted_messages = trim_conversation_history(messages, max_tokens=budget)
+            state_dict: InputAgentState = {"messages": converted_messages}
+            result = await graph.ainvoke(input=cast(Any, state_dict), config=invocation_config)
+            return result
+        except Exception as e:
+            last_error = e
+            err_str = str(e)
+
+            if "tool_use_failed" in err_str and attempt == 0:
+                logger.warning("[INVOKE] tool_use_failed — retrying once")
+                continue
+
+            if "rate_limit_exceeded" in err_str and "tokens per minute" in err_str and attempt < 2:
+                budget = int(budget * 0.6)
+                logger.warning(f"[INVOKE] TPM exceeded, retrying with budget={budget}")
+                continue
+
+            logger.error(f"[INVOKE] Agent invocation failed: {err_str}")
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Agent invocation failed")

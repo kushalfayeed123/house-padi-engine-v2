@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from sentence_transformers import SentenceTransformer
 
@@ -55,16 +55,35 @@ def vectorize_property_data(address: str, ownerId: str, location: str, specs: Di
     return embedding.tolist()
 
 
-def vectorize_search_query(query_text: str) -> List[float]:
+def vectorize_search_query(location: str, bedrooms: Optional[int] = None) -> List[float]:
     """
-    Encodes raw, user-facing search strings cleanly without schema boilerplate.
-    Prevents template noise from corrupting cosine similarity calculations.
+    Encodes user search criteria into a structured text format 
+    that mirrors the property embedding schema to maximize cosine similarity.
     """
+    # Build a clean feature subset matching the property vectorization style
+    clean_specs = f"{{'bedrooms': {bedrooms}}}" if bedrooms is not None else "{}"
+    
+    # Mirror the structure used in vectorize_property_data
+    query_context = (
+        f"Location Area: {location.strip()}. "
+        f"Physical Attributes and Features: {clean_specs}."
+    )
+    
     model = get_model()
-    # Explicitly use encode_query if available or standard encode on raw text
-    embedding = model.encode(f"query: {query_text.strip()}")
+    # Encode using the structured query context (removing the arbitrary 'query:' prefix)
+    embedding = model.encode(query_context)
     return embedding.tolist()
 
+
+async def vectorize_search_query_async(location: str, bedrooms: Optional[int] = None) -> List[float]:
+    """
+    Asynchronous wrapper for query vectorization to keep the event loop unblocked.
+    """
+    return await asyncio.to_thread(
+        vectorize_search_query,
+        location,
+        bedrooms
+    )
 
 async def vectorize_property_data_async(address: str, ownerId: str, location: str, specs: Dict[str, Any]) -> List[float]:
     """
