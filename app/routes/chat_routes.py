@@ -1,3 +1,4 @@
+import urllib.parse
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
 from app.dependecies import get_optional_user_context
@@ -23,21 +24,23 @@ async def chat_endpoint(
             # Condition 1: Action requires authentication entirely (e.g., dashboard, account)
             if "dashboard" in target_url or "account" in target_url:
                 if not context:
+                    encoded_return = urllib.parse.quote(target_url, safe="")
                     return ChatResponse(
                         status="success",
                         type="redirect",
-                        response="Please sign in to continue.",
-                        redirect_url="/login"  # Change to your frontend login route
+                        response="Please click the link below to sign in and continue your request.",
+                        redirect_url=f"/login?returnUrl={encoded_return}"
                     )
 
             # Condition 2: If URL is for landlords, verify user authentication and role
             if "landlord" in target_url:
                 if not context:
+                    encoded_return = urllib.parse.quote(target_url, safe="")
                     return ChatResponse(
                         status="success",
                         type="redirect",
-                        response="Please sign in as a landlord to access this feature.",
-                        redirect_url="/login"
+                        response="Please click the link below to sign in as a landlord and complete your request.",
+                        redirect_url=f"/login?returnUrl={encoded_return}"
                     )
                 if context.get("role") != "owner":
                     return ChatResponse(
@@ -46,11 +49,11 @@ async def chat_endpoint(
                         response="You are not authorized to access landlord features."
                     )
 
-            # If authorized or public redirect, proceed normally
+            # If authorized or public redirect, prompt the user to click the link
             return ChatResponse(
                 status="success",
                 type="redirect",
-                response="Redirecting...",
+                response="Please click the link below to complete your request.",
                 redirect_url=target_url
             )
             

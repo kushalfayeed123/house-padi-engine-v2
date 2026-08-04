@@ -25,17 +25,11 @@ from app.intent_transformer import dynamic_intent_router
 from app.services.chat_persistence import load_thread_history_from_db, save_message_to_db
 from app.services.lightweight_agent import invoke_lightweight_agent
 from app.services.token_budget import trim_conversation_history
-from app.ui_registry import INTENT_UI_MAP
-from app.ui_registry import INTENT_UI_MAP
+from app.ui_registry import INTENT_CONTENT_MAP, INTENT_UI_MAP
 
 logger = logging.getLogger("uvicorn")
 
 AGENT_BACKEND = os.getenv("AGENT_BACKEND", "lightweight").strip().lower()
-INTENT_CONTENT_MAP = {
-    "TRIGGER_PROPERTY_UI": "Opening the property listing form for you...",
-    "TRIGGER_PAYMENT_UI": "Taking you to your payments page...",
-    "TRIGGER_KYC_UI": "Opening identity verification..."
-}
 
 
 def _get_multi_agent_invoker():
@@ -64,6 +58,13 @@ async def process_chat_message(
         await save_message_to_db(thread_id=thread_id, content=message, is_ai_response=False, sender_id=user_id)
         
         target_url = INTENT_UI_MAP[detected_intent]
+        
+        if detected_intent == "TRIGGER_DASHBOARD_UI":
+            if user_role == "owner":
+                target_url = "/dashboard/landlord"
+            else:
+                target_url = "/dashboard/renter"
+                
         response_content = INTENT_CONTENT_MAP.get(detected_intent, "Redirecting...")
         
         redirect_payload = {
