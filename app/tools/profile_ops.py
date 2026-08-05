@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 import asyncio
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
-from app.database import supabase_client
+from app.core.database import supabase_client
 from pydantic import BaseModel, Field
 from logging import getLogger
 

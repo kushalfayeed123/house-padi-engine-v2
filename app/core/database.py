@@ -1,6 +1,6 @@
 import anyio
 from supabase import create_client, Client
-from app.config import settings
+from app.core.config import settings
 
 # Unified admin level coordinator client
 supabase_client: Client = create_client(

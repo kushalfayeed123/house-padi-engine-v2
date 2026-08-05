@@ -3,17 +3,23 @@ from typing import Optional
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
-from app.database import supabase_client, db
+from app.core.database import db, supabase_client
 from logging import getLogger
 
 logger = getLogger("uvicorn")
 
 
+
 class BookTourInput(BaseModel):
-    property_id: str = Field(..., description="The unique UUID string of the property asset listing.")
-    tour_date: str = Field(..., description="The preferred ISO timestamp format (YYYY-MM-DD HH:MM:SS) for the tour appointment.")
+    property_id: str = Field(
+        ...,
+        description="The unique UUID string of the property asset listing."
+    )
 
-
+    tour_date: Optional[str] = Field(
+        default=None,
+        description="Preferred tour datetime. Leave empty if the user has not chosen one yet."
+    )
 def generate_google_maps_link(latitude: Optional[float], 
     longitude: Optional[float], address: str) -> str:
     """Generate a Google Maps link for property directions."""
@@ -25,14 +31,11 @@ def generate_google_maps_link(latitude: Optional[float],
 @tool("book_tour_worker", args_schema=BookTourInput)
 async def book_tour_worker(
     property_id: str, 
-    tour_date: str, 
+    tour_date: Optional[str], 
     config: RunnableConfig
 ) -> str:
-    """Schedules a new physical property site viewing appointment.
-    
-    Includes automatic direction link generation using property coordinates.
-    Fetches property details and user profile info automatically.
-    Sends notifications to landlord for approval.
+    """Schedule, book, or request a new physical site viewing / tour appointment for a renter. 
+    Use this when a user wants to visit, inspect, or book a viewing date/time for a property.
     """
     user_id = config.get("configurable", {}).get("user_id")
     if not user_id:
@@ -69,6 +72,14 @@ async def book_tour_worker(
         if not property_res.data:
             return f"Execution Error: Property {property_id} not found."
         
+        if not tour_date:
+            return json.dumps({
+                "status": "awaiting_datetime",
+                "property_id": property_id,
+                "ui_component": "calendar_picker",
+                "message": "Please choose a preferred date and time."
+            })
+        
         property_data = property_res.data
         owner_id = property_data.get("owner_id")
         address_full = property_data.get("address_full", "")
@@ -98,11 +109,15 @@ async def book_tour_worker(
         
         # 4. Create notification for landlord (would trigger in real implementation)
         notification_payload = {
-            "recipient_id": owner_id,
-            "type": "tour_request",
-            "content": f"{visitor_name} has requested a tour on {tour_date}",
-            "related_tour_id": tour_id,
-            "status": "unread"
+            "user_id": owner_id,
+            "title": "tour_request",
+            "message": f"{visitor_name} has requested a tour on {tour_date}",
+            "is_read": False,
+            "metadata": {
+                "property_id": property_id,
+                "tour_id": tour_id,
+                "tour_date": tour_date,
+            }
         }
         
         try:
@@ -122,9 +137,8 @@ async def book_tour_worker(
 
 @tool("list_tours_worker")
 async def list_tours_worker(config: RunnableConfig) -> str:
-    """Retrieves all scheduled property tours and viewings for the authenticated user.
-    
-    Returns tours with directions links and approval status.
+    """Retrieves already scheduled property tours or viewing history for the current user.
+    Do NOT use this to book or schedule a new tour.
     """
     user_id = config.get("configurable", {}).get("user_id")
     user_role = config.get("configurable", {}).get("user_role", "renter")
@@ -134,7 +148,7 @@ async def list_tours_worker(config: RunnableConfig) -> str:
 
     try:
         # Different queries based on role (renters see their bookings, landlords see requests for their properties)
-        if user_role == "landlord":
+        if user_role == "owner":
             # Fetch tours for properties owned by this landlord
             res = await db.execute(
                 supabase_client.table("tours")
@@ -187,9 +201,8 @@ async def list_tours_worker(config: RunnableConfig) -> str:
 
 @tool("approve_tour_worker")
 async def approve_tour_worker(tour_id: str, config: RunnableConfig) -> str:
-    """Approves a tour request (landlord only).
-    
-    Updates tour status to 'approved' and notifies the renter.
+    """STRICTLY FOR LANDLORDS: Approves or accepts an existing pending tour request.
+    Do NOT use this when a renter wants to book or schedule a new tour.
     """
     user_id = config.get("configurable", {}).get("user_id")
     user_role = config.get("configurable", {}).get("user_role", "renter")

@@ -1,29 +1,36 @@
 import asyncio
 from typing import List, Optional
-from app.database import supabase_client
 from logging import getLogger
+from app.core.database import supabase_client
 
 logger = getLogger("uvicorn")
 
+# Bounds the DB fetch regardless of how long a thread has been running —
+# relevant once WhatsApp threads can stay open for weeks/months. This is
+# intentionally larger than trim_conversation_history's 4000-token budget
+# leaves room for, so trimming still has real history to choose from; it
+# just stops the DB call itself from growing unbounded with thread age.
+DEFAULT_HISTORY_FETCH_LIMIT = 40
 
-async def load_thread_history_from_db(thread_id: str) -> List[dict]:
+
+async def load_thread_history_from_db(thread_id: str, limit: int = DEFAULT_HISTORY_FETCH_LIMIT) -> List[dict]:
     """
-    Fetches stored message history for a given thread ID from the 
-    'messages' table, mapped to standard LLM chat role formats.
+    Fetches the most recent `limit` messages for a thread, oldest-first,
+    mapped to standard LLM chat role formats.
     """
     try:
         res = await asyncio.to_thread(
             lambda: supabase_client.table("messages")
             .select("content, is_ai_response, created_at")
             .eq("thread_id", thread_id)
-            .order("created_at", desc=False)
+            .order("created_at", desc=True)  # newest first, so LIMIT keeps the most recent messages
+            .limit(limit)
             .execute()
         )
-        
+
         history = []
         if res.data:
-            for msg in res.data:
-                # guard against non-dict rows to satisfy static type checkers
+            for msg in reversed(res.data):  # back to chronological order for the model
                 if isinstance(msg, dict):
                     is_ai = bool(msg.get("is_ai_response"))
                     content = msg.get("content")
@@ -32,7 +39,6 @@ async def load_thread_history_from_db(thread_id: str) -> List[dict]:
                     content = None
 
                 if content is None:
-                    # skip malformed rows
                     continue
 
                 role = "assistant" if is_ai else "user"
@@ -44,38 +50,40 @@ async def load_thread_history_from_db(thread_id: str) -> List[dict]:
 
 
 async def save_message_to_db(
-    thread_id: str, 
-    content: str, 
-    is_ai_response: bool, 
+    thread_id: str,
+    content: str,
+    is_ai_response: bool,
     sender_id: Optional[str] = None,
     property_id: Optional[str] = None,
     owner_id: Optional[str] = None,
-    renter_id: Optional[str] = None
+    renter_id: Optional[str] = None,
+    upsert_thread: bool = True,
 ) -> None:
     """
-    Ensures the chat thread exists in 'chat_threads' and appends 
-    the new message to the 'messages' table.
+    Appends a message to 'messages', ensuring the parent 'chat_threads' row
+    exists first — unless upsert_thread=False, for callers that know the
+    thread was already touched earlier in the same turn (e.g. the
+    assistant-reply save right after the user-message save).
     """
     try:
-        # 1. Upsert thread record to maintain relation constraints
-        thread_payload = {
-            "id": thread_id,
-            "last_message_at": "now()"
-        }
-        if property_id:
-            thread_payload["property_id"] = property_id
-        if owner_id:
-            thread_payload["owner_id"] = owner_id
-        if renter_id:
-            thread_payload["renter_id"] = renter_id
+        if upsert_thread:
+            thread_payload = {
+                "id": thread_id,
+                "last_message_at": "now()"
+            }
+            if property_id:
+                thread_payload["property_id"] = property_id
+            if owner_id:
+                thread_payload["owner_id"] = owner_id
+            if renter_id:
+                thread_payload["renter_id"] = renter_id
 
-        await asyncio.to_thread(
-            lambda: supabase_client.table("chat_threads")
-            .upsert(thread_payload, on_conflict="id")
-            .execute()
-        )
+            await asyncio.to_thread(
+                lambda: supabase_client.table("chat_threads")
+                .upsert(thread_payload, on_conflict="id")
+                .execute()
+            )
 
-        # 2. Insert the message into the messages table
         message_payload = {
             "thread_id": thread_id,
             "sender_id": sender_id if not is_ai_response else None,
@@ -88,6 +96,6 @@ async def save_message_to_db(
             .insert(message_payload)
             .execute()
         )
-        
+
     except Exception as e:
         logger.error(f"[CHAT DB SAVE ERROR] {str(e)}")

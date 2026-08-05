@@ -7,7 +7,7 @@ from logging import getLogger
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Header, Request, UploadFile
 from langchain_core.tools import BaseTool
 
-from app.dependecies import get_optional_user_context
+from app.core.dependecies import get_optional_user_context
 from app.models.property import PropertySchema
 from app.services.property_ai_service import PropertyAIService
 from app.tools.property_ops import (

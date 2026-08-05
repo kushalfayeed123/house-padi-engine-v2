@@ -1,391 +1,266 @@
 -- HousePadi Database Schema Migration
--- Created: 2026-07-15
--- Description: Initial schema for HousePadi real estate platform
+-- Aligned with Live Database Inspection Schema
+
+-- ============================================
+-- EXTENSIONS
+-- ============================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";
 
 -- ============================================
 -- ENUM TYPES
 -- ============================================
 
-CREATE TYPE kyc_status AS ENUM ('pending', 'verified', 'rejected');
-CREATE TYPE property_status AS ENUM ('draft', 'published', 'rented', 'delisted');
-CREATE TYPE transaction_type AS ENUM ('rent_payment', 'deposit', 'refund', 'platform_fee');
-CREATE TYPE application_status AS ENUM ('submitted', 'reviewing', 'approved', 'rejected');
-CREATE TYPE user_role AS ENUM ('user', 'landlord', 'renter', 'admin');
-CREATE TYPE transaction_status AS ENUM ('pending', 'completed', 'failed', 'cancelled');
-
+CREATE TYPE public.profiles_kyc_status_enum AS ENUM ('pending', 'verified', 'rejected');
+CREATE TYPE public.properties_status_enum AS ENUM ('draft', 'published', 'rented', 'delisted');
+CREATE TYPE public.transactions_type_enum AS ENUM ('rent_payment', 'deposit', 'refund', 'platform_fee');
+CREATE TYPE public.kyc_verifications_status_enum AS ENUM ('pending', 'verified', 'rejected');
+CREATE TYPE public.ledger_entry_type_enum AS ENUM ('debit', 'credit');
+CREATE TYPE public.ledger_entry_category_enum AS ENUM ('rent', 'deposit', 'withdrawal', 'fee');
 
 -- ============================================
--- PROFILES TABLE (Users)
+-- PROFILES TABLE
 -- ============================================
 
-CREATE TABLE profiles (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) NOT NULL UNIQUE,
-    first_name VARCHAR(100) NOT NULL,
-    last_name VARCHAR(100) NOT NULL,
-    phone_number VARCHAR(20),
-    role user_role DEFAULT 'user',
-    avatar_url TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE
+CREATE TABLE public.profiles (
+    id UUID NOT NULL,
+    kyc_status public.profiles_kyc_status_enum NOT NULL DEFAULT 'pending'::public.profiles_kyc_status_enum,
+    email VARCHAR NOT NULL UNIQUE,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    avatar_url VARCHAR,
+    role VARCHAR NOT NULL DEFAULT 'user'::VARCHAR,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    phone_number VARCHAR,
+    CONSTRAINT profiles_pkey PRIMARY KEY (id)
 );
-
-CREATE INDEX idx_profiles_email ON profiles(email);
-CREATE INDEX idx_profiles_role ON profiles(role);
-CREATE INDEX idx_profiles_created_at ON profiles(created_at);
-
 
 -- ============================================
 -- PROPERTIES TABLE
 -- ============================================
 
-CREATE TABLE properties (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    address_full TEXT NOT NULL,
-    location VARCHAR(100) NOT NULL,
-    latitude DECIMAL(10, 8),
-    longitude DECIMAL(11, 8),
-    price NUMERIC(12, 2) NOT NULL CHECK (price > 0),
-    currency VARCHAR(3) DEFAULT 'USD',
+CREATE TABLE public.properties (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    owner_id UUID NOT NULL,
     description TEXT,
-    images TEXT[] DEFAULT ARRAY[]::TEXT[],
-    features JSONB DEFAULT '{}'::JSONB,
-    lease_duration_months INTEGER DEFAULT 12,
+    price NUMERIC NOT NULL,
+    currency VARCHAR NOT NULL DEFAULT 'USD'::VARCHAR,
+    images TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+    features JSONB NOT NULL DEFAULT '{}'::JSONB,
+    status public.properties_status_enum NOT NULL DEFAULT 'draft'::public.properties_status_enum,
+    metadata JSONB,
+    is_featured BOOLEAN NOT NULL DEFAULT FALSE,
+    coords JSONB,
+    lease_duration_months INTEGER NOT NULL DEFAULT 12,
     agreement_content TEXT,
-    metadata JSONB DEFAULT '{}'::JSONB,
-    is_featured BOOLEAN DEFAULT FALSE,
-    status property_status DEFAULT 'draft',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE
+    title VARCHAR NOT NULL,
+    address_full VARCHAR NOT NULL,
+    location VARCHAR NOT NULL,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    embedding vector(1536),
+    "aiSummary" TEXT,
+    "deletedAt" TIMESTAMP WITHOUT TIME ZONE,
+    CONSTRAINT properties_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_797b76e2d11a5bf755127d1aa67 FOREIGN KEY (owner_id) REFERENCES public.profiles(id)
 );
-
-CREATE INDEX idx_properties_owner_id ON properties(owner_id);
-CREATE INDEX idx_properties_location ON properties(location);
-CREATE INDEX idx_properties_status ON properties(status);
-CREATE INDEX idx_properties_is_featured ON properties(is_featured);
-CREATE INDEX idx_properties_price ON properties(price);
-CREATE INDEX idx_properties_created_at ON properties(created_at);
-CREATE INDEX idx_properties_coordinates ON properties(latitude, longitude);
-
 
 -- ============================================
 -- TOURS TABLE
 -- ============================================
 
-CREATE TABLE tours (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-    visitor_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
-    visitor_name VARCHAR(255) NOT NULL,
-    visitor_contact VARCHAR(255) NOT NULL,
+CREATE TABLE public.tours (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    property_id UUID NOT NULL,
+    visitor_id UUID NOT NULL,
+    visitor_name TEXT,
+    visitor_contact TEXT,
+    visitor_email TEXT,
     tour_date TIMESTAMP WITH TIME ZONE NOT NULL,
-    status VARCHAR(50) DEFAULT 'scheduled',
-    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'pending_approval'::TEXT,
+    directions_link TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    CONSTRAINT tours_pkey PRIMARY KEY (id),
+    CONSTRAINT tours_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id),
+    CONSTRAINT tours_visitor_id_fkey FOREIGN KEY (visitor_id) REFERENCES auth.users(id)
 );
-
-CREATE INDEX idx_tours_property_id ON tours(property_id);
-CREATE INDEX idx_tours_visitor_id ON tours(visitor_id);
-CREATE INDEX idx_tours_tour_date ON tours(tour_date);
-CREATE INDEX idx_tours_status ON tours(status);
-
 
 -- ============================================
 -- APPLICATIONS TABLE
 -- ============================================
 
-CREATE TABLE applications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-    renter_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    status application_status DEFAULT 'submitted',
+CREATE TABLE public.applications (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    property_id UUID NOT NULL,
+    renter_id UUID NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted'::TEXT,
+    ai_match_score INTEGER,
     screening_summary TEXT,
-    ai_match_score INTEGER CHECK (ai_match_score >= 0 AND ai_match_score <= 100),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    applied_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    lease_id VARCHAR,
+    contract_url VARCHAR,
+    CONSTRAINT applications_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_782e944003aa91e3f934089e01e FOREIGN KEY (property_id) REFERENCES public.properties(id),
+    CONSTRAINT FK_63f747ac503d0c0ee55a3dc8404 FOREIGN KEY (renter_id) REFERENCES public.profiles(id)
 );
-
-CREATE INDEX idx_applications_property_id ON applications(property_id);
-CREATE INDEX idx_applications_renter_id ON applications(renter_id);
-CREATE INDEX idx_applications_status ON applications(status);
-CREATE INDEX idx_applications_created_at ON applications(created_at);
-
 
 -- ============================================
 -- LEASES TABLE
 -- ============================================
 
-CREATE TABLE leases (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-    renter_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    owner_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+CREATE TABLE public.leases (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    property_id UUID NOT NULL,
+    owner_id UUID NOT NULL,
+    renter_id UUID NOT NULL,
     start_date DATE NOT NULL,
-    end_date DATE,
-    rent NUMERIC(12, 2) NOT NULL CHECK (rent > 0),
-    currency VARCHAR(3) DEFAULT 'USD',
-    contract_url TEXT,
-    status VARCHAR(50) DEFAULT 'active',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+    contract_url VARCHAR,
+    rent NUMERIC NOT NULL,
+    CONSTRAINT leases_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_ee853e23faf915f2c7da39a96f6 FOREIGN KEY (property_id) REFERENCES public.properties(id),
+    CONSTRAINT FK_5a1a743f1482261d88fd33ea66f FOREIGN KEY (renter_id) REFERENCES public.profiles(id)
 );
-
-CREATE INDEX idx_leases_property_id ON leases(property_id);
-CREATE INDEX idx_leases_renter_id ON leases(renter_id);
-CREATE INDEX idx_leases_owner_id ON leases(owner_id);
-CREATE INDEX idx_leases_status ON leases(status);
-CREATE INDEX idx_leases_start_date ON leases(start_date);
-
 
 -- ============================================
 -- TRANSACTIONS TABLE
 -- ============================================
 
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    lease_id UUID NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
-    payer_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
-    platform_fee NUMERIC(12, 2) DEFAULT 0 CHECK (platform_fee >= 0),
-    type transaction_type DEFAULT 'rent_payment',
-    currency VARCHAR(3) DEFAULT 'USD',
-    payment_gateway_ref VARCHAR(255) NOT NULL UNIQUE,
-    status transaction_status DEFAULT 'pending',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+CREATE TABLE public.transactions (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    lease_id UUID NOT NULL,
+    payer_id UUID NOT NULL,
+    amount NUMERIC NOT NULL,
+    platform_fee NUMERIC NOT NULL,
+    type public.transactions_type_enum NOT NULL DEFAULT 'rent_payment'::public.transactions_type_enum,
+    currency VARCHAR NOT NULL DEFAULT 'USD'::VARCHAR,
+    payment_gateway_ref VARCHAR NOT NULL UNIQUE,
+    status VARCHAR NOT NULL,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT transactions_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_f9c5381f2459e223afe9fa68029 FOREIGN KEY (lease_id) REFERENCES public.leases(id)
 );
 
-CREATE INDEX idx_transactions_lease_id ON transactions(lease_id);
-CREATE INDEX idx_transactions_payer_id ON transactions(payer_id);
-CREATE INDEX idx_transactions_status ON transactions(status);
-CREATE INDEX idx_transactions_type ON transactions(type);
-CREATE INDEX idx_transactions_created_at ON transactions(created_at);
-CREATE INDEX idx_transactions_payment_gateway_ref ON transactions(payment_gateway_ref);
-
-
 -- ============================================
--- KYC VERIFICATION TABLE
+-- BANK DETAILS TABLE
 -- ============================================
 
-CREATE TABLE kyc_verifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    id_type VARCHAR(50) NOT NULL,
-    id_number VARCHAR(100) NOT NULL,
-    id_image_url TEXT NOT NULL,
-    status kyc_status DEFAULT 'pending',
-    verification_date TIMESTAMP WITH TIME ZONE,
-    verified_by UUID REFERENCES profiles(id) ON DELETE SET NULL,
-    rejection_reason TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+CREATE TABLE public.bank_details (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL UNIQUE,
+    bank_name VARCHAR NOT NULL,
+    bank_code VARCHAR NOT NULL,
+    account_number VARCHAR NOT NULL,
+    account_name VARCHAR NOT NULL,
+    recipient_code VARCHAR,
+    CONSTRAINT bank_details_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_8eba31ad3c2e07c029ee73e48cb FOREIGN KEY (user_id) REFERENCES public.profiles(id)
 );
-
-CREATE INDEX idx_kyc_verifications_user_id ON kyc_verifications(user_id);
-CREATE INDEX idx_kyc_verifications_status ON kyc_verifications(status);
-CREATE INDEX idx_kyc_verifications_created_at ON kyc_verifications(created_at);
-CREATE UNIQUE INDEX idx_kyc_verifications_user_latest ON kyc_verifications(user_id DESC, created_at DESC);
-
 
 -- ============================================
 -- WALLETS TABLE
 -- ============================================
 
-CREATE TABLE wallets (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE,
-    balance NUMERIC(15, 2) DEFAULT 0 CHECK (balance >= 0),
-    currency VARCHAR(3) DEFAULT 'USD',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+CREATE TABLE public.wallets (
+    balance NUMERIC NOT NULL DEFAULT 0,
+    "userId" UUID NOT NULL,
+    "updatedAt" TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT wallets_pkey PRIMARY KEY ("userId")
 );
-
-CREATE INDEX idx_wallets_user_id ON wallets(user_id);
-
 
 -- ============================================
 -- LEDGER ENTRIES TABLE
 -- ============================================
 
-CREATE TABLE ledger_entries (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
-    amount NUMERIC(15, 2) NOT NULL,
-    type VARCHAR(20) NOT NULL CHECK (type IN ('debit', 'credit')),
-    category VARCHAR(100) NOT NULL,
-    reference_id UUID,
-    description TEXT,
-    balance_after NUMERIC(15, 2),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+CREATE TABLE public.ledger_entries (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    amount NUMERIC NOT NULL,
+    type public.ledger_entry_type_enum NOT NULL,
+    category public.ledger_entry_category_enum NOT NULL,
+    "walletId" VARCHAR NOT NULL,
+    "referenceId" VARCHAR,
+    "createdAt" TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT ledger_entries_pkey PRIMARY KEY (id)
 );
 
-CREATE INDEX idx_ledger_entries_wallet_id ON ledger_entries(wallet_id);
-CREATE INDEX idx_ledger_entries_type ON ledger_entries(type);
-CREATE INDEX idx_ledger_entries_category ON ledger_entries(category);
-CREATE INDEX idx_ledger_entries_created_at ON ledger_entries(created_at);
+-- ============================================
+-- KYC VERIFICATIONS TABLE
+-- ============================================
 
+CREATE TABLE public.kyc_verifications (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL UNIQUE,
+    status public.kyc_verifications_status_enum NOT NULL DEFAULT 'pending'::public.kyc_verifications_status_enum,
+    id_type VARCHAR NOT NULL,
+    id_number VARCHAR NOT NULL,
+    id_image_url VARCHAR NOT NULL,
+    rejection_reason VARCHAR,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT kyc_verifications_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_1e23c7821d740b4881f773c39aa FOREIGN KEY (user_id) REFERENCES public.profiles(id)
+);
 
 -- ============================================
 -- CHAT THREADS TABLE
 -- ============================================
 
-CREATE TABLE chat_threads (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    renter_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
-    owner_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
-    property_id UUID REFERENCES properties(id) ON DELETE SET NULL,
-    subject VARCHAR(255),
-    status VARCHAR(50) DEFAULT 'active',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+CREATE TABLE public.chat_threads (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    property_id UUID,
+    renter_id UUID,
+    owner_id UUID,
+    last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT chat_threads_pkey PRIMARY KEY (id),
+    CONSTRAINT chat_threads_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id),
+    CONSTRAINT chat_threads_renter_id_fkey FOREIGN KEY (renter_id) REFERENCES public.profiles(id),
+    CONSTRAINT chat_threads_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.profiles(id)
 );
-
-CREATE INDEX idx_chat_threads_renter_id ON chat_threads(renter_id);
-CREATE INDEX idx_chat_threads_owner_id ON chat_threads(owner_id);
-CREATE INDEX idx_chat_threads_property_id ON chat_threads(property_id);
-CREATE INDEX idx_chat_threads_status ON chat_threads(status);
-CREATE INDEX idx_chat_threads_created_at ON chat_threads(created_at);
-
 
 -- ============================================
 -- MESSAGES TABLE
 -- ============================================
 
-CREATE TABLE messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
-    sender_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+CREATE TABLE public.messages (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    thread_id UUID,
+    sender_id UUID,
     content TEXT NOT NULL,
     is_ai_response BOOLEAN DEFAULT FALSE,
-    read_at TIMESTAMP WITH TIME ZONE,
+    embedding vector(1536),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    CONSTRAINT messages_pkey PRIMARY KEY (id),
+    CONSTRAINT messages_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.chat_threads(id),
+    CONSTRAINT messages_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.profiles(id)
 );
 
-CREATE INDEX idx_messages_thread_id ON messages(thread_id);
-CREATE INDEX idx_messages_sender_id ON messages(sender_id);
-CREATE INDEX idx_messages_is_ai_response ON messages(is_ai_response);
-CREATE INDEX idx_messages_created_at ON messages(created_at);
-CREATE INDEX idx_messages_thread_created ON messages(thread_id, created_at);
-
-
 -- ============================================
--- TRIGGERS FOR updated_at TIMESTAMPS
+-- MESSAGE EMBEDDINGS TABLE
 -- ============================================
 
--- Function to update updated_at column
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Triggers for all tables with updated_at
-CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON profiles
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_properties_updated_at BEFORE UPDATE ON properties
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_tours_updated_at BEFORE UPDATE ON tours
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_applications_updated_at BEFORE UPDATE ON applications
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_leases_updated_at BEFORE UPDATE ON leases
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_transactions_updated_at BEFORE UPDATE ON transactions
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_kyc_verifications_updated_at BEFORE UPDATE ON kyc_verifications
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_wallets_updated_at BEFORE UPDATE ON wallets
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_chat_threads_updated_at BEFORE UPDATE ON chat_threads
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_messages_updated_at BEFORE UPDATE ON messages
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
+CREATE TABLE public.message_embeddings (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    message_id UUID NOT NULL,
+    embedding vector(1536),
+    metadata JSONB DEFAULT '{}'::JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT message_embeddings_pkey PRIMARY KEY (id),
+    CONSTRAINT message_embeddings_message_id_fkey FOREIGN KEY (message_id) REFERENCES public.messages(id)
+);
 
 -- ============================================
--- ROW LEVEL SECURITY POLICIES (Optional)
+-- CHAT MESSAGES TABLE
 -- ============================================
 
--- Enable RLS on all tables
-ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE properties ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tours ENABLE ROW LEVEL SECURITY;
-ALTER TABLE applications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE leases ENABLE ROW LEVEL SECURITY;
-ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE kyc_verifications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wallets ENABLE ROW LEVEL SECURITY;
-ALTER TABLE ledger_entries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE chat_threads ENABLE ROW LEVEL SECURITY;
-ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
-
--- Profile: Users can only view their own profile (relaxed for now - apply restrictions as needed)
--- Property: Anyone can view published properties, only owners can modify
--- Wallet: Only the owner can view/modify their wallet
--- Messages: Participants of the thread can view messages
-
--- ============================================
--- MATERIALIZED VIEWS (Optional - for analytics)
--- ============================================
-
--- Active leases view
-CREATE MATERIALIZED VIEW active_leases_view AS
-SELECT 
-    l.id,
-    l.property_id,
-    p.title as property_title,
-    l.renter_id,
-    r.email as renter_email,
-    l.owner_id,
-    o.email as owner_email,
-    l.rent,
-    l.start_date,
-    l.end_date,
-    l.status,
-    l.created_at
-FROM leases l
-JOIN properties p ON l.property_id = p.id
-JOIN profiles r ON l.renter_id = r.id
-JOIN profiles o ON l.owner_id = o.id
-WHERE l.status = 'active';
-
-CREATE INDEX idx_active_leases_view_property_id ON active_leases_view(property_id);
-CREATE INDEX idx_active_leases_view_renter_id ON active_leases_view(renter_id);
-CREATE INDEX idx_active_leases_view_owner_id ON active_leases_view(owner_id);
-
-
--- Property statistics view
-CREATE MATERIALIZED VIEW property_statistics_view AS
-SELECT 
-    p.id,
-    p.title,
-    p.location,
-    p.price,
-    COUNT(DISTINCT t.id) as tour_count,
-    COUNT(DISTINCT a.id) as application_count,
-    COUNT(DISTINCT l.id) as active_lease_count
-FROM properties p
-LEFT JOIN tours t ON p.id = t.property_id AND t.status = 'scheduled'
-LEFT JOIN applications a ON p.id = a.property_id AND a.status IN ('submitted', 'reviewing')
-LEFT JOIN leases l ON p.id = l.property_id AND l.status = 'active'
-WHERE p.deleted_at IS NULL
-GROUP BY p.id, p.title, p.location, p.price;
-
-CREATE INDEX idx_property_statistics_view_location ON property_statistics_view(location);
+CREATE TABLE public.chat_messages (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    "userId" UUID,
+    content TEXT NOT NULL,
+    role VARCHAR NOT NULL,
+    "createdAt" TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    action VARCHAR DEFAULT 'NONE'::VARCHAR,
+    CONSTRAINT chat_messages_pkey PRIMARY KEY (id),
+    CONSTRAINT FK_43d968962b9e24e1e3517c0fbff FOREIGN KEY ("userId") REFERENCES public.profiles(id)
+);

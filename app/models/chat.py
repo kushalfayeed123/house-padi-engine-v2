@@ -9,6 +9,7 @@ class ChatRequest(BaseModel):
 
     
 class ChatResponse(BaseModel):
+    thread_id: str | None = None
     type: str = "response"  # Default to 'response'
     status: str = "success"  # Default to 'response'
     message: Optional[str] = None

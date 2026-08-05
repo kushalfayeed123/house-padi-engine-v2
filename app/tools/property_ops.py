@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
-from app.database import supabase_client, db
+from app.core.database import db, supabase_client
 from app.services.cache_service import _generate_cache_key, cache_get, cache_invalidate, cache_set
 from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query
 from pydantic import BaseModel, Field, field_validator
@@ -24,7 +24,13 @@ class SearchPropertiesInput(BaseModel):
 
 @tool("search_properties_worker")
 async def search_properties_worker(location: str, base_price: Optional[float] = None, bedrooms: Optional[int] = None) -> str:
-    """Finds properties matching location and filter criteria."""
+    """Finds available rental properties, apartments, or houses matching a
+    location and optional filters like bedroom count or max price. Use
+    this whenever someone is looking for, searching for, or asking about
+    places to rent — for example: 'find me a 2 bedroom apartment in
+    Lekki', 'show me houses in Abuja under 2 million', 'search for a flat
+    near Unilag', 'what properties do you have in Jos', '3 bedroom in
+    Port Harcourt'."""
 
     # === CACHE CHECK (avoid redundant embedding + RPC calls) ===
     cache_payload = {

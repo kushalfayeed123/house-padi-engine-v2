@@ -1,10 +1,11 @@
 import urllib.parse
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
-from app.dependecies import get_optional_user_context
+from app.core.dependecies import get_optional_user_context
 from app.models.chat import ChatRequest, ChatResponse
 from app.services.chat_service import process_chat_message
 from logging import getLogger
+
 
 logger = getLogger("uvicorn")
 router = APIRouter()
@@ -18,7 +19,7 @@ async def chat_endpoint(
         service_result = await process_chat_message(body.message, body.thread_id, context)
         
         # Handle Redirect Path
-        if service_result["type"] == "redirect":
+        if service_result.get("type") == "redirect":
             target_url = service_result.get("redirect_url", "")
             
             # Condition 1: Action requires authentication entirely (e.g., dashboard, account)
@@ -26,6 +27,7 @@ async def chat_endpoint(
                 if not context:
                     encoded_return = urllib.parse.quote(target_url, safe="")
                     return ChatResponse(
+                        thread_id=service_result.get("thread_id"),
                         status="success",
                         type="redirect",
                         response="Please click the link below to sign in and continue your request.",
@@ -37,6 +39,7 @@ async def chat_endpoint(
                 if not context:
                     encoded_return = urllib.parse.quote(target_url, safe="")
                     return ChatResponse(
+                        thread_id=service_result.get("thread_id"),
                         status="success",
                         type="redirect",
                         response="Please click the link below to sign in as a landlord and complete your request.",
@@ -44,6 +47,7 @@ async def chat_endpoint(
                     )
                 if context.get("role") != "owner":
                     return ChatResponse(
+                        thread_id=service_result.get("thread_id"),
                         status="error",
                         type="response",
                         response="You are not authorized to access landlord features."
@@ -51,6 +55,7 @@ async def chat_endpoint(
 
             # If authorized or public redirect, prompt the user to click the link
             return ChatResponse(
+                thread_id=service_result.get("thread_id"),
                 status="success",
                 type="redirect",
                 response="Please click the link below to complete your request.",
@@ -58,7 +63,24 @@ async def chat_endpoint(
             )
             
         # Handle standard Chat Response Path
+        content = (service_result.get("content") or "").lower()
+        if not context and (
+            "user context missing" in content
+            or "sign in first" in content
+            or "log in or create an account" in content
+            or "please sign in" in content
+            or service_result.get("requires_login")
+        ):
+            return ChatResponse(
+                thread_id=service_result.get("thread_id"),
+                status="success",
+                type="redirect",
+                response="Please sign in to continue your request.",
+                redirect_url=service_result.get("redirect_url") or "/login?returnUrl=/"
+            )
+
         return ChatResponse(
+            thread_id=service_result.get("thread_id"),
             status="success",
             type="response",
             response=service_result["content"],
