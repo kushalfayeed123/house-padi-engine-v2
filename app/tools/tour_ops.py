@@ -1,5 +1,5 @@
 import json
-from typing import Optional
+from typing import Literal, Optional
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
@@ -199,19 +199,38 @@ async def list_tours_worker(config: RunnableConfig) -> str:
         return f"Database Interface Exception: {str(e)}"
 
 
-@tool("approve_tour_worker")
-async def approve_tour_worker(tour_id: str, config: RunnableConfig) -> str:
-    """STRICTLY FOR LANDLORDS: Approves or accepts an existing pending tour request.
+@tool("manage_tour_request_worker")
+async def manage_tour_request_worker(
+    tour_id: str, 
+    action: Literal["approve", "deny"], 
+    config: RunnableConfig
+) -> str:
+    """STRICTLY FOR LANDLORDS: Approves or denies an existing pending tour request.
+    
+    Args:
+        tour_id: The ID of the tour request to update.
+        action: Must be either 'approve' or 'deny'.
+        config: LangChain runtime config containing user context.
+        
     Do NOT use this when a renter wants to book or schedule a new tour.
     """
     user_id = config.get("configurable", {}).get("user_id")
     user_role = config.get("configurable", {}).get("user_role", "renter")
     
-    if user_role != "landlord":
-        return "Security Guardrail: Only landlords can approve tours."
+    if user_role != "owner":
+        return "Security Guardrail: Only landlords can manage tour requests."
     
     if not user_id:
         return "Security Guardrail: Request denied."
+
+    # Normalize action input
+    normalized_action = action.lower().strip()
+    if normalized_action in ["approve", "approved"]:
+        new_status = "approved"
+    elif normalized_action in ["deny", "denied", "reject", "rejected"]:
+        new_status = "denied"
+    else:
+        return f"Invalid action '{action}'. Action must be either 'approve' or 'deny'."
 
     try:
         # Verify the tour belongs to a property owned by this landlord
@@ -230,24 +249,24 @@ async def approve_tour_worker(tour_id: str, config: RunnableConfig) -> str:
         property_owner = tour.get("properties", {}).get("owner_id")
         
         if property_owner != user_id:
-            return "Security Guardrail: You can only approve tours for your own properties."
+            return "Security Guardrail: You can only manage tours for your own properties."
         
         # Update tour status
-        update_res = await db.execute(
+        await db.execute(
             supabase_client.table("tours")
-            .update({"status": "approved"})
+            .update({"status": new_status})
             .eq("id", tour_id)
             .execute
         )
         
-        logger.info(f"[TOUR APPROVED] Tour {tour_id} approved by landlord {user_id}")
+        logger.info(f"[TOUR {new_status.upper()}] Tour {tour_id} {new_status} by landlord {user_id}")
         
         # Notify renter
         renter_id = tour.get("visitor_id")
         notification_payload = {
             "recipient_id": renter_id,
-            "type": "tour_approved",
-            "content": f"Your tour request has been approved for {tour.get('tour_date')}",
+            "type": f"tour_{new_status}",
+            "message": f"Your tour request has been {new_status} for {tour.get('tour_date')}",
             "related_tour_id": tour_id,
             "status": "unread"
         }
@@ -257,8 +276,8 @@ async def approve_tour_worker(tour_id: str, config: RunnableConfig) -> str:
         except Exception as e:
             logger.warning(f"Failed to notify renter: {str(e)}")
         
-        return f"Success: Tour {tour_id} approved. Renter has been notified."
+        return f"Success: Tour {tour_id} {new_status}. Renter has been notified."
         
     except Exception as e:
-        logger.error(f"[APPROVE TOUR ERROR] {str(e)}")
+        logger.error(f"[MANAGE TOUR ERROR] {str(e)}")
         return f"Database Interface Exception: {str(e)}"

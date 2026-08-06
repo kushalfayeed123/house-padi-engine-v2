@@ -22,4 +22,5 @@ dependencies = [
     "langchain-google-genai>=4.2.6",
     "langchain-ollama>=1.1.0",
     "python-multipart>=0.0.32",
+    "reportlab>=5.0.0",
 ]

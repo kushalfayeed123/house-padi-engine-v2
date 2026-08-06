@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 # Import your routes
-from app.routes import auth_routes, profile_routes, property_routes, chat_routes, tour_routes
+from app.routes import application_routes, auth_routes, lease_routes, payment_routes, profile_routes, property_routes, chat_routes, tour_routes
 # Import model loader
 from app.services import property_cron
 from app.services.vector_service import get_model
@@ -94,6 +94,9 @@ app.include_router(property_routes.router)
 app.include_router(chat_routes.router)
 app.include_router(profile_routes.router)
 app.include_router(tour_routes.router)
+app.include_router(application_routes.router)
+app.include_router(lease_routes.router)
+app.include_router(payment_routes.router)
 
 
 @app.get("/")

@@ -1,60 +1,33 @@
-import json
-from logging import getLogger
-from typing import cast
+"""
+Application Router
+Endpoints for submitting lease applications, landlord approvals, and rejection handling.
+"""
 
-from fastapi import APIRouter, Depends, HTTPException
+import json
+from typing import Optional, cast
+from fastapi import APIRouter, Depends, HTTPException, Body
 from langchain_core.tools import BaseTool
 
 from app.core.dependecies import get_optional_user_context
-from app.tools.tour_ops import (
-    BookTourInput,
-    book_tour_worker,
-    list_tours_worker,
-    manage_tour_request_worker,
-)
+from app.tools.application_lease_ops import get_applications_worker, manage_application_worker, submit_application_worker
 
-logger = getLogger("uvicorn")
-router = APIRouter(prefix="/api/tours", tags=["Tours"])
+router = APIRouter(prefix="/api/applications", tags=["Applications"])
 
 
-@router.post("/book")
-async def book_tour(
-    data: BookTourInput,
+
+@router.get("/landlord")  # Endpoint alias for front-end query compatibility
+async def get_user_applications(
     context: dict = Depends(get_optional_user_context)
 ):
-    """Book or schedule a viewing tour for a property."""
-    if not context or not context.get("id"):
-        raise HTTPException(status_code=401, detail="Authentication required to book a tour.")
-
-    tool = cast(BaseTool, book_tour_worker)
-    result = await tool.ainvoke(
-        data.model_dump(),
-        config={
-            "configurable": {
-                "user_id": context["id"],
-                "user_role": context.get("role", "renter"),
-            }
-        },
-    )
-
-    res_str = str(result)
-    if "Security Guardrail" in res_str:
-        raise HTTPException(status_code=403, detail=res_str)
-    if "Execution Error" in res_str or "Database Interface Exception" in res_str:
-        raise HTTPException(status_code=400, detail=res_str)
-
-    return {"status": "success", "message": res_str}
-
-
-@router.get("/landlord/listings")
-async def list_tours(
-    context: dict = Depends(get_optional_user_context)
-):
-    """Retrieve scheduled property tours for the authenticated user (renter or landlord)."""
+    """Fetches applications based on authenticated user's role.
+    
+    - Owner: Returns applications for properties owned by landlord.
+    - Renter: Returns applications submitted by renter.
+    """
     if not context or not context.get("id"):
         raise HTTPException(status_code=401, detail="Authentication required.")
 
-    tool = cast(BaseTool, list_tours_worker)
+    tool = cast(BaseTool, get_applications_worker)
     result = await tool.ainvoke(
         {},
         config={
@@ -66,27 +39,36 @@ async def list_tours(
     )
 
     res_str = str(result)
+    
+    # Error Guardrails
     if "Security Guardrail" in res_str:
         raise HTTPException(status_code=403, detail=res_str)
     if "Database Interface Exception" in res_str:
         raise HTTPException(status_code=500, detail=res_str)
 
-    # Tool returns a JSON-serialized list string
-    return json.loads(res_str)
+    try:
+        return json.loads(res_str)
+    except json.JSONDecodeError:
+        return {"status": "success", "data": res_str}
 
-
-@router.post("/{tour_id}/approve")
-async def approve_tour(
-    tour_id: str,
+@router.post("/properties/{property_id}/apply")
+async def apply_for_property(
+    property_id: str,
+    renter_signature: str = Body(..., embed=True),
+    start_date: str = Body(..., embed=True),
     context: dict = Depends(get_optional_user_context)
 ):
-    """Approve a pending tour request. Restricted strictly to landlords/owners."""
+    """Submits a rental application and appends applicant signature."""
     if not context or not context.get("id"):
         raise HTTPException(status_code=401, detail="Authentication required.")
 
-    tool = cast(BaseTool, manage_tour_request_worker)
+    tool = cast(BaseTool, submit_application_worker)
     result = await tool.ainvoke(
-        {"tour_id": tour_id, "action": "approve"},
+        {
+            "property_id": property_id,
+            "renter_signature": renter_signature,
+            "start_date": start_date
+        },
         config={
             "configurable": {
                 "user_id": context["id"],
@@ -106,22 +88,62 @@ async def approve_tour(
     return {"status": "success", "message": res_str}
 
 
-@router.post("/{tour_id}/deny")
-async def deny_tour(
-    tour_id: str,
+@router.post("/{application_id}/approve")
+async def approve_application(
+    application_id: str,
+    landlord_signature: str = Body(..., embed=True),
     context: dict = Depends(get_optional_user_context)
 ):
-    """Deny a pending tour request. Restricted strictly to landlords/owners."""
+    """Landlord approves an application and appends landlord signature."""
     if not context or not context.get("id"):
         raise HTTPException(status_code=401, detail="Authentication required.")
 
-    tool = cast(BaseTool, manage_tour_request_worker)
+    tool = cast(BaseTool, manage_application_worker)
     result = await tool.ainvoke(
-        {"tour_id": tour_id, "action": "deny"},
+        {
+            "application_id": application_id,
+            "action": "approve",
+            "landlord_signature": landlord_signature
+        },
         config={
             "configurable": {
                 "user_id": context["id"],
-                "user_role": context.get("role", "renter"),
+                "user_role": context.get("role", "owner"),
+            }
+        },
+    )
+
+    res_str = str(result)
+    if "Security Guardrail" in res_str:
+        raise HTTPException(status_code=403, detail=res_str)
+    if "not found" in res_str.lower():
+        raise HTTPException(status_code=404, detail=res_str)
+    if "Database Interface Exception" in res_str:
+        raise HTTPException(status_code=500, detail=res_str)
+
+    return {"status": "success", "message": res_str}
+
+
+@router.post("/{application_id}/reject")
+async def reject_application(
+    application_id: str,
+    context: dict = Depends(get_optional_user_context)
+):
+    """Landlord rejects an application."""
+    if not context or not context.get("id"):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    tool = cast(BaseTool, manage_application_worker)
+    result = await tool.ainvoke(
+        {
+            "application_id": application_id,
+            "action": "reject",
+            "landlord_signature": None
+        },
+        config={
+            "configurable": {
+                "user_id": context["id"],
+                "user_role": context.get("role", "owner"),
             }
         },
     )

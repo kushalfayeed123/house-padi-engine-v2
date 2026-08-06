@@ -19,9 +19,10 @@ from sentence_transformers import SentenceTransformer
 
 from app.services.token_budget import trim_conversation_history, budget_for_model
 
+from app.tools.application_lease_ops import manage_application_worker, submit_application_worker
 from app.tools.property_ops import create_property_worker, search_properties_worker, trigger_property_ui_worker
-from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
-from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
+from app.tools.tour_ops import book_tour_worker, list_tours_worker,\
+    manage_tour_request_worker
 from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
 from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker
 from app.tools.chat_ops import create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker
@@ -62,9 +63,9 @@ CONVERSATION GUIDELINES:
 
 ALL_TOOLS: List[BaseTool] = [
     search_properties_worker, trigger_property_ui_worker,
-    book_tour_worker, list_tours_worker, approve_tour_worker,
-    create_lease_worker, sign_lease_worker, evaluate_application_worker,
-    process_payment_worker, get_wallet_balance_worker, split_payment_worker,
+    book_tour_worker, list_tours_worker, manage_tour_request_worker,
+    manage_application_worker, submit_application_worker,
+    get_wallet_balance_worker, process_payment_worker, split_payment_worker,
     submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker,
     create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker,
     create_property_worker,
