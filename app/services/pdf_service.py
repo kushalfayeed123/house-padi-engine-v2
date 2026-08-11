@@ -64,7 +64,7 @@ async def generate_and_upload_lease_pdf(
         file_path = f"leases/{lease_id}/executed_lease.pdf"
 
         # Upload byte stream directly to Supabase Storage bucket
-        supabase_client.storage.from_(bucket_name).upload(
+        supabase_client.storage.from_('house-padi-assets').upload(
             file_path,
             pdf_bytes,
             file_options={"content-type": "application/pdf", "upsert": "true"}

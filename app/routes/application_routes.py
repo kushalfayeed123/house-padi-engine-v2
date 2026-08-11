@@ -9,15 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from langchain_core.tools import BaseTool
 
 from app.core.dependecies import get_optional_user_context
-from app.tools.application_lease_ops import get_applications_worker, manage_application_worker, submit_application_worker
+from app.tools.application_lease_ops import get_application_details_worker, get_applications_worker, manage_application_worker, submit_application_worker
 
 router = APIRouter(prefix="/api/applications", tags=["Applications"])
 
 
-
 @router.get("/landlord")  # Endpoint alias for front-end query compatibility
 async def get_user_applications(
-    context: dict = Depends(get_optional_user_context)
+    context: dict=Depends(get_optional_user_context)
 ):
     """Fetches applications based on authenticated user's role.
     
@@ -51,12 +50,13 @@ async def get_user_applications(
     except json.JSONDecodeError:
         return {"status": "success", "data": res_str}
 
+
 @router.post("/properties/{property_id}/apply")
 async def apply_for_property(
     property_id: str,
-    renter_signature: str = Body(..., embed=True),
-    start_date: str = Body(..., embed=True),
-    context: dict = Depends(get_optional_user_context)
+    renter_signature: str=Body(..., embed=True),
+    start_date: str=Body(..., embed=True),
+    context: dict=Depends(get_optional_user_context)
 ):
     """Submits a rental application and appends applicant signature."""
     if not context or not context.get("id"):
@@ -78,21 +78,28 @@ async def apply_for_property(
     )
 
     res_str = str(result)
+    
+    # Catch guardrail and error conditions returned as strings
     if "Security Guardrail" in res_str:
         raise HTTPException(status_code=403, detail=res_str)
     if "not found" in res_str.lower():
         raise HTTPException(status_code=404, detail=res_str)
-    if "Database Interface Exception" in res_str:
+    if "Database Error" in res_str or "failure" in res_str.lower():
         raise HTTPException(status_code=500, detail=res_str)
 
-    return {"status": "success", "message": res_str}
+    # Parse JSON result from tool so properties are available at response.data root
+    try:
+        response_data = json.loads(res_str)
+        return response_data
+    except json.JSONDecodeError:
+        return {"status": "success", "message": res_str}
 
 
 @router.post("/{application_id}/approve")
 async def approve_application(
     application_id: str,
-    landlord_signature: str = Body(..., embed=True),
-    context: dict = Depends(get_optional_user_context)
+    landlord_signature: str=Body(..., embed=True),
+    context: dict=Depends(get_optional_user_context)
 ):
     """Landlord approves an application and appends landlord signature."""
     if not context or not context.get("id"):
@@ -127,7 +134,7 @@ async def approve_application(
 @router.post("/{application_id}/reject")
 async def reject_application(
     application_id: str,
-    context: dict = Depends(get_optional_user_context)
+    context: dict=Depends(get_optional_user_context)
 ):
     """Landlord rejects an application."""
     if not context or not context.get("id"):
@@ -157,3 +164,39 @@ async def reject_application(
         raise HTTPException(status_code=500, detail=res_str)
 
     return {"status": "success", "message": res_str}
+
+
+@router.get("/{application_id}")
+async def get_application_status(
+    application_id: str,
+    context: dict = Depends(get_optional_user_context)
+):
+    """Fetches full application details and current status by application ID."""
+    if not context or not context.get("id"):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    tool = cast(BaseTool, get_application_details_worker)
+    result = await tool.ainvoke(
+        {"application_id": application_id},
+        config={
+            "configurable": {
+                "user_id": context["id"],
+                "user_role": context.get("role", "renter"),
+            }
+        },
+    )
+
+    res_str = str(result)
+    
+    # Error Guardrails matching project patterns
+    if "Security Guardrail" in res_str:
+        raise HTTPException(status_code=403, detail=res_str)
+    if "not found" in res_str.lower():
+        raise HTTPException(status_code=404, detail=res_str)
+    if "Database Interface Exception" in res_str:
+        raise HTTPException(status_code=500, detail=res_str)
+
+    try:
+        return json.loads(res_str)
+    except json.JSONDecodeError:
+        return {"status": "success", "data": res_str}

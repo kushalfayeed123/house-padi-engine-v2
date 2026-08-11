@@ -30,15 +30,15 @@ class ManageApplicationInput(BaseModel):
     screening_summary: Optional[str] = Field(None, description="Optional notes on evaluation decision")
 
 
-
-
 @tool
 async def get_applications_worker(config: RunnableConfig) -> str:
-    """Fetches lease applications scoped by the user's role.
+    """Fetches lease/rental applications scoped by the caller's role — a
+    landlord sees applications received for their properties, a renter
+    sees applications they've submitted. Use this for requests like 'show
+    me my applications', 'what applications have I received', 'check the
+    status of my rental application', 'view pending applications for my
+    properties'."""
     
-    - Owner/Landlord: Retrieves applications for properties owned by the user.
-    - Renter: Retrieves applications submitted by the user.
-    """
     configurable = config.get("configurable", {})
     user_id = configurable.get("user_id")
     user_role = configurable.get("user_role", "renter")
@@ -79,9 +79,10 @@ async def submit_application_worker(
     start_date: str,
     config: RunnableConfig
 ) -> str:
-    """STRICTLY FOR RENTERS: Submits a lease application, performs automated KYC match scoring,
-    and creates a draft lease awaiting landlord countersignature.
-    """
+    """STRICTLY FOR RENTERS: Submits a formal rental application for a
+    specific property, running automated KYC match scoring and creating a
+    draft lease awaiting landlord countersignature..."""
+    
     user_id = config.get("configurable", {}).get("user_id")
     
     if not user_id:
@@ -125,7 +126,6 @@ async def submit_application_worker(
             owner_name = f"{owner_profile.get('first_name', '')} {owner_profile.get('last_name', '')}".strip() or "Landlord"
             base_agreement = generate_base_lease_template(prop, owner_name)
             
-            # Save base template to property
             await db.execute(
                 supabase_client.table("properties")
                 .update({"agreement_content": base_agreement})
@@ -147,7 +147,7 @@ async def submit_application_worker(
         lease_res = await db.execute(
             supabase_client.table("leases")
             .insert(lease_payload)
-            .select()  # <--- Added .select() to return inserted row
+            .select()
             .execute
         )
         if not lease_res or not lease_res.data:
@@ -168,7 +168,7 @@ async def submit_application_worker(
         app_res = await db.execute(
             supabase_client.table("applications")
             .insert(app_payload)
-            .select()  # <--- Added .select() to return inserted row
+            .select()
             .execute
         )
         if not app_res or not app_res.data:
@@ -182,43 +182,59 @@ async def submit_application_worker(
             "title": "New Rental Application Received",
             "message": f"New application for {prop.get('title')}. AI Match Score: {ai_match_score}/100. Review and countersign.",
             "type": "application_submitted",
-            "metadata": {"application_id": app_id, "property_id": property_id}
+            "metadata": {"application_id": str(app_id), "property_id": property_id}
         }
         await db.execute(supabase_client.table("notifications").insert(notif).execute)
 
         logger.info(f"[APPLICATION SUBMITTED] App ID {app_id} created for property {property_id}")
-        return f"Success: Application submitted (ID: {app_id}). Match Score: {ai_match_score}/100. Awaiting landlord countersignature."
+        
+        # Return structured JSON string for the backend route to parse
+        return json.dumps({
+            "status": "success",
+            "data": {
+                "application_id": str(app_id),
+                "lease_id": str(lease_id),
+                "ai_match_score": ai_match_score,
+            },
+            "message": f"Application submitted successfully."
+        })
 
     except Exception as e:
         logger.error(f"[SUBMIT APPLICATION ERROR] {str(e)}")
         return f"Application submission failure: {str(e)}"
+
     
 @tool("manage_application_worker")
 async def manage_application_worker(
     application_id: str,
     action: Literal["approve", "reject"],
     config: RunnableConfig,
-    landlord_signature: Optional[str] = None,
-    screening_summary: Optional[str] = None
+    landlord_signature: Optional[str]=None,
+    screening_summary: Optional[str]=None
 ) -> str:
-    """STRICTLY FOR LANDLORDS: Evaluates a renter's application, appends landlord countersignature if approved, 
-    and notifies applicant to proceed to rent payment.
-    """
+    """STRICTLY FOR LANDLORDS: Approves or rejects a renter's pending
+    rental application, appending the landlord's digital countersignature
+    if approved, and notifying the applicant to proceed to payment. Use
+    this when a LANDLORD wants to accept or decline someone who applied to
+    rent their property. Example requests: 'approve this application',
+    'reject this applicant', 'accept the renter's application', 'decline
+    this rental request', 'countersign the lease for this applicant'."""
+    
     user_id = config.get("configurable", {}).get("user_id")
 
     if not user_id:
         return "Security Guardrail: Execution context validation failed."
 
     try:
-        # Fetch Application & Property
+        # 1. Fetch Application & Property (Removed nested leases(*) query)
         app_res = await db.execute(
             supabase_client.table("applications")
-            .select("*, properties(owner_id, price, title), leases(*)")
+            .select("*, properties(owner_id, price, title)")
             .eq("id", application_id)
-            .single()
+            .maybe_single()
             .execute
         )
-        if not app_res.data:
+        if not app_res or not app_res.data:
             return f"Application {application_id} not found."
 
         app = app_res.data
@@ -230,6 +246,7 @@ async def manage_application_worker(
         renter_id = app.get("renter_id")
         lease_id = app.get("lease_id")
 
+        # 2. Handle Rejection Flow
         if action == "reject":
             summary = screening_summary or "Application does not meet requirements."
             await db.execute(
@@ -249,7 +266,7 @@ async def manage_application_worker(
             await db.execute(supabase_client.table("notifications").insert(notif).execute)
             return f"Success: Application {application_id} rejected."
 
-        # Handle Approval Flow
+        # 3. Handle Approval Flow
         if not landlord_signature:
             return "Error: Landlord digital signature is required to approve and countersign the lease."
 
@@ -263,18 +280,29 @@ async def manage_application_worker(
             .execute
         )
 
-        # Save Landlord Signature to Draft Lease
+        # 4. Fetch Lease separately and Append Landlord Signature
         if lease_id:
-            existing_url = app.get("leases", {}).get("contract_url", "")
+            lease_res = await db.execute(
+                supabase_client.table("leases")
+                .select("contract_url")
+                .eq("id", lease_id)
+                .maybe_single()
+                .execute
+            )
+            
+            existing_url = ""
+            if lease_res and lease_res.data:
+                existing_url = lease_res.data.get("contract_url", "")
+
             updated_signatures = f"{existing_url}|LANDLORD_SIGNED:{landlord_signature}"
             await db.execute(
                 supabase_client.table("leases")
-                .update({"contract_url": updated_signatures})
+                .update({"contract_url": updated_signatures, "is_active": True})
                 .eq("id", lease_id)
                 .execute
             )
 
-        # Notify Renter to Make Payment
+        # 5. Notify Renter to Make Payment
         rent_amount = app.get("properties", {}).get("price", 0)
         notif_renter = {
             "user_id": renter_id,
@@ -291,3 +319,48 @@ async def manage_application_worker(
     except Exception as e:
         logger.error(f"[MANAGE APPLICATION ERROR] {str(e)}")
         return f"Application evaluation failure: {str(e)}"
+    
+    
+@tool("get_application_details_worker")
+async def get_application_details_worker(
+    application_id: str,
+    config: RunnableConfig
+) -> str:
+    """Fetches details and current status of a specific rental application,
+    ensuring proper authorization for landlords or renters."""
+    
+    configurable = config.get("configurable", {})
+    user_id = configurable.get("user_id")
+    user_role = configurable.get("user_role", "renter")
+
+    if not user_id:
+        return "Security Guardrail: Execution context validation failed."
+
+    try:
+        res = await db.execute(
+            supabase_client.table("applications")
+            .select("*, properties(id, title, address_full, owner_id, price)")
+            .eq("id", application_id)
+            .maybe_single()
+            .execute
+        )
+        
+        if not res or not res.data:
+            return f"Application {application_id} not found."
+        
+        app = res.data
+        owner_id = app.get("properties", {}).get("owner_id")
+        renter_id = app.get("renter_id")
+
+        # Restrict access to the application owner (renter) or property owner (landlord)
+        if user_role not in ["admin", "system"] and user_id != owner_id and user_id != renter_id:
+            return "Security Guardrail: You are not authorized to view this application."
+
+        return json.dumps({
+            "status": "success",
+            "data": app
+        })
+
+    except Exception as e:
+        logger.error(f"[GET APPLICATION DETAILS ERROR] {str(e)}")
+        return f"Database Interface Exception: {str(e)}"

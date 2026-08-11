@@ -21,7 +21,7 @@ from app.services.token_budget import trim_conversation_history, budget_for_mode
 
 from app.tools.application_lease_ops import manage_application_worker, submit_application_worker
 from app.tools.property_ops import create_property_worker, search_properties_worker, trigger_property_ui_worker
-from app.tools.tour_ops import book_tour_worker, list_tours_worker,\
+from app.tools.tour_ops import book_tour_worker, list_tours_worker, \
     manage_tour_request_worker
 from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
 from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker
@@ -158,6 +158,15 @@ TOOL_UI_FALLBACKS: Dict[str, ToolUIFallback] = {
         uuid_fields=["property_id"],
         prompt_message="I'd be happy to help schedule a tour. Please select a valid property or pick your preferred date and time:",
         force_threshold=0.35,
+    ),
+    
+    "submit_application_worker": ToolUIFallback(
+    ui_component="lease_application_signer",
+    action="lease_ui",
+    passthrough_fields=["property_id"],
+    uuid_fields=["property_id"],
+    prompt_message="Let's get your rental application started — please review and sign below:",
+    force_threshold=0.4,
     ),
 }
 
@@ -393,16 +402,35 @@ def _get_missing_or_unconfirmed_args(tool, args, messages):
 # --- Tier 2: Agent Execution ---
 
 
-_READ_ONLY_FORCE_THRESHOLD = 0.55
+# Tools scoring within this margin of the top score are considered "tied" —
+# ranking noise at this scale isn't a reliable enough signal to force a
+# specific tool over the model's own judgment.
+_FORCE_CLUSTER_MARGIN = 0.05
 
 
 def _find_force_candidate(ranked: List[Tuple[BaseTool, float]]) -> Optional[str]:
-    for tool, score in ranked:
-        if tool.name.startswith(("search_", "get_", "list_")) and score >= _READ_ONLY_FORCE_THRESHOLD:
-            return tool.name
-        fallback = TOOL_UI_FALLBACKS.get(tool.name)
-        if fallback and score >= fallback.force_threshold:
-            return tool.name
+    if not ranked:
+        return None
+
+    top_score = ranked[0][1]
+    tied_leaders = [t for t, s in ranked if s >= top_score - _FORCE_CLUSTER_MARGIN]
+
+    if len(tied_leaders) > 1:
+        logger.info(
+            f"[LIGHTWEIGHT] Ranking too ambiguous to force "
+            f"({len(tied_leaders)} tools within {_FORCE_CLUSTER_MARGIN} of top score {top_score:.3f}: "
+            f"{[t.name for t in tied_leaders]}) — leaving tool_choice to the model."
+        )
+        return None
+
+    top_tool = tied_leaders[0]
+    if top_tool.name.startswith(("search_", "get_", "list_")) and top_score >= _FORCE_CLUSTER_MARGIN:
+        return top_tool.name
+
+    fallback = TOOL_UI_FALLBACKS.get(top_tool.name)
+    if fallback and top_score >= fallback.force_threshold:
+        return top_tool.name
+
     return None
 
 

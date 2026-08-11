@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.core.database import db, supabase_client
 from app.core.dependecies import get_optional_user_context
 
-router = APIRouter(prefix="/leases", tags=["Leases"])
+router = APIRouter(prefix="/api/leases", tags=["Leases"])
 
 @router.get("/{lease_id}/document")
 async def get_lease_document(
@@ -39,7 +39,7 @@ async def get_lease_document(
 
     # Generate 60-minute signed URL from Supabase Storage
     try:
-        res = supabase_client.storage.from_("lease-documents").create_signed_url(
+        res = supabase_client.storage.from_("house-padi-assets").create_signed_url(
             path=storage_path,
             expires_in=3600
         )

@@ -154,6 +154,7 @@ async def list_tours_worker(config: RunnableConfig) -> str:
                 supabase_client.table("tours")
                 .select("*, properties(id, title, address_full, owner_id)")
                 .eq("properties.owner_id", user_id)
+                .order("created_at", desc=True)
                 .execute
             )
         else:
@@ -162,6 +163,7 @@ async def list_tours_worker(config: RunnableConfig) -> str:
                 supabase_client.table("tours")
                 .select("*, properties(id, title, address_full, owner_id, coords)")
                 .eq("visitor_id", user_id)
+                .order("created_at", desc=True)
                 .execute
             )
         

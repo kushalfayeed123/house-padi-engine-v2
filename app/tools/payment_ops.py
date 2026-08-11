@@ -37,14 +37,11 @@ async def process_payment_worker(
     config: RunnableConfig,
     payment_method: str = "bank_transfer"
 ) -> str:
-    """Processes rental payment from renter.
+    """Processes rental payment from renter atomically.
     
     - Validates lease and renter application status
-    - Creates transaction record and platform fee split
     - Compiles final lease agreement and uploads PDF to Supabase Storage
-    - Activates lease and marks application as completed
-    - Dispatches notifications for key handover
-    - Updates ledger entries
+    - Atomically writes transaction, ledger entries, lease updates, application completion, and notifications via PostgreSQL RPC
     """
     user_id = config.get("configurable", {}).get("user_id")
     
@@ -52,7 +49,7 @@ async def process_payment_worker(
         return "Security Guardrail: User context missing."
 
     try:
-        # Fetch lease details
+        # 1. Fetch lease details
         lease_res = await db.execute(
             supabase_client.table("leases")
             .select("id, property_id, owner_id, renter_id, rent, start_date, is_active, contract_url")
@@ -65,14 +62,15 @@ async def process_payment_worker(
             return f"Lease {lease_id} not found."
         
         lease = lease_res.data
+        landlord_id = lease.get("owner_id")
         
-        # Verify payment is from renter
+        # 2. Verify payment is from renter
         if user_id != lease.get("renter_id"):
             return "Security Guardrail: Only the renter can make payments on this lease."
         
-        # Check application status for initial lease activation
-        is_initial_activation = not lease.get("is_active")
-        if is_initial_activation:
+        # 3. Check application status for initial lease activation
+        is_initial_activation = lease.get("is_active")
+        if not is_initial_activation:
             app_res = await db.execute(
                 supabase_client.table("applications")
                 .select("status")
@@ -84,76 +82,15 @@ async def process_payment_worker(
             if app_status != "approved_pending_payment":
                 return "Error: Cannot process payment. The application has not been approved by the landlord yet."
         
-        # Calculate platform fee (5%)
+        # 4. Calculate platform fee (5%)
         platform_fee = amount * 0.05
         landlord_amount = amount - platform_fee
         
-        # Create transaction record
-        transaction_payload = {
-            "lease_id": lease_id,
-            "payer_id": user_id,
-            "amount": amount,
-            "platform_fee": platform_fee,
-            "type": "rent_payment",
-            "currency": "USD",
-            "payment_gateway_ref": f"TXN_{datetime.now().timestamp()}",  # In production, use real payment gateway
-            "status": "pending_verification"
-        }
+        storage_path = lease.get("contract_url")
+        renter_name = "Tenant"
         
-        txn_res = await db.execute(
-            supabase_client.table("transactions").insert(transaction_payload).execute
-        )
-        
-        transaction_id = txn_res.data[0].get("id")
-        logger.info(f"[PAYMENT CREATED] Transaction {transaction_id}: ${amount} from {user_id}")
-        
-        # Create ledger entries
-        landlord_id = lease.get("owner_id")
-        
-        ledger_landlord = {
-            "walletId": str(landlord_id),
-            "amount": landlord_amount,
-            "type": "credit",
-            "category": "rent_received",
-            "referenceId": transaction_id,
-            "createdAt": datetime.now().isoformat()
-        }
-        
-        ledger_platform = {
-            "walletId": "platform",
-            "amount": platform_fee,
-            "type": "credit",
-            "category": "platform_fee",
-            "referenceId": transaction_id,
-            "createdAt": datetime.now().isoformat()
-        }
-        
-        ledger_renter = {
-            "walletId": str(user_id),
-            "amount": -amount,
-            "type": "debit",
-            "category": "rent_paid",
-            "referenceId": transaction_id,
-            "createdAt": datetime.now().isoformat()
-        }
-        
-        try:
-            await db.execute(
-                supabase_client.table("ledger_entries").insert(ledger_landlord).execute
-            )
-            await db.execute(
-                supabase_client.table("ledger_entries").insert(ledger_platform).execute
-            )
-            await db.execute(
-                supabase_client.table("ledger_entries").insert(ledger_renter).execute
-            )
-            logger.info(f"[LEDGER ENTRIES] Created for transaction {transaction_id}")
-        except Exception as e:
-            logger.warning(f"Could not create ledger entries: {str(e)}")
-
-        # --- LEASE ACTIVATION & PDF STORAGE TRIGGER ---
+        # 5. Handle PDF Generation & Storage Upload prior to DB transaction commit
         if is_initial_activation:
-            # Fetch user profiles and property base template
             renter_prof = await db.execute(
                 supabase_client.table("profiles").select("first_name, last_name").eq("id", user_id).single().execute
             )
@@ -168,7 +105,6 @@ async def process_payment_worker(
             owner_name = f"{owner_prof.data.get('first_name', '')} {owner_prof.data.get('last_name', '')}".strip() if owner_prof.data else "Landlord"
             base_agreement = (prop_res.data.get("agreement_content") if prop_res.data else None) or "Standard Residential Lease Agreement"
 
-            # 1. Inject names/signatures into contract text
             today_str = datetime.now().strftime("%Y-%m-%d")
             final_contract_text = finalize_executed_lease(
                 base_agreement=base_agreement,
@@ -180,63 +116,50 @@ async def process_payment_worker(
                 renter_signed_at=today_str
             )
 
-            # 2. Compile text to PDF and upload to Supabase Storage
             storage_path = await generate_and_upload_lease_pdf(
                 lease_id=lease_id,
                 contract_text=final_contract_text
             )
 
-            # 3. Update Lease to active with PDF storage path
-            await db.execute(
-                supabase_client.table("leases")
-                .update({
-                    "is_active": True,
-                    "contract_url": storage_path
-                })
-                .eq("id", lease_id)
-                .execute
-            )
+        # 6. Execute Atomic PostgreSQL RPC Transaction
+        rpc_payload = {
+            "p_lease_id": lease_id,
+            "p_payer_id": user_id,
+            "p_amount": amount,
+            "p_platform_fee": platform_fee,
+            "p_landlord_amount": landlord_amount,
+            "p_landlord_id": landlord_id,
+            "p_storage_path": storage_path,
+            "p_renter_name": renter_name,
+            "p_is_initial_activation": is_initial_activation,
+            "p_currency": "NGN",
+        }
 
-            # 4. Update Application status to completed
-            await db.execute(
-                supabase_client.table("applications")
-                .update({"status": "completed"})
-                .eq("lease_id", lease_id)
-                .execute
-            )
+        rpc_res = await db.execute(
+            supabase_client.rpc("process_payment_atomic", rpc_payload).execute
+        )
 
-            # 5. Dispatch Key Handover notifications
-            notif_renter = {
-                "user_id": user_id,
-                "title": "Payment Confirmed — Ready to Move In!",
-                "message": "Your rent payment is verified and your lease is active. Please contact your landlord for key collection.",
-                "type": "key_handover_ready",
-                "metadata": {"lease_id": lease_id}
-            }
-            notif_owner = {
-                "user_id": landlord_id,
-                "title": "Rent Payment Verified — Key Handover",
-                "message": f"Payment from {renter_name} confirmed. The lease is active. You may now arrange key handover.",
-                "type": "key_handover_owner",
-                "metadata": {"lease_id": lease_id}
-            }
-            await db.execute(supabase_client.table("notifications").insert(notif_renter).execute)
-            await db.execute(supabase_client.table("notifications").insert(notif_owner).execute)
+        if not rpc_res or not rpc_res.data:
+            return "Payment processing failure: Database transaction returned no response."
 
-            logger.info(f"[LEASE ACTIVATED] Lease {lease_id} activated and PDF saved to {storage_path}")
+        result_data = rpc_res.data
+        if isinstance(result_data, str):
+            result_data = json.loads(result_data)
+
+        transaction_id = result_data.get("transaction_id")
+        logger.info(f"[ATOMIC PAYMENT SUCCESS] Transaction {transaction_id} processed successfully for lease {lease_id}")
 
         return (
-            f"Success: Payment of ${amount} USD processed. Transaction ID: {transaction_id}. "
+            f"Success: Payment of ${amount}  processed atomically. Transaction ID: {transaction_id}. "
             f"Landlord will receive: ${landlord_amount:.2f} (after 5% platform fee: ${platform_fee:.2f}). "
             f"{'Lease is now ACTIVE and PDF agreement generated.' if is_initial_activation else ''}"
         )
         
     except Exception as e:
-        logger.error(f"[PAYMENT ERROR] {str(e)}")
+        logger.error(f"[PAYMENT ATOMIC ERROR] {str(e)}")
         import traceback
         traceback.print_exc()
-        return f"Payment processing failure: {str(e)}"
-
+        return f"Payment processing failure (Rolled back): {str(e)}"
 
 @tool("get_wallet_balance_worker")
 async def get_wallet_balance_worker(config: RunnableConfig) -> str:
