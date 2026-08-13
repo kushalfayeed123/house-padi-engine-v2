@@ -221,27 +221,51 @@ class GetFeaturedInput(BaseModel):
 
 
 @tool("get_featured_worker", args_schema=GetFeaturedInput)
-async def get_featured_worker(limit: int=6) -> str:
+@tool("get_featured_worker", args_schema=GetFeaturedInput)
+async def get_featured_worker(limit: int = 6) -> str:
     """
     Retrieves the curated list of featured properties for the HousePadi marketplace.
-    Optimized for front-page display.
+    Optimized for front-page display with real-time status validation.
     """
     cache_key = "featured_properties"
     
-    # === CACHE CHECK ===
+    # === CACHE CHECK & VALIDATION ===
     cached_result = cache_get(cache_key)
     if cached_result:
-        logger.info("[CACHE HIT] Returning featured properties.")
-        return cached_result
+        try:
+            cached_properties = json.loads(cached_result)
+            if cached_properties:
+                property_ids = [p["id"] for p in cached_properties]
+                
+                # Verify current database status for these specific cached IDs
+                res = await asyncio.to_thread(
+                    supabase_client.table("properties")
+                    .select("id, status, is_featured")
+                    .in_("id", property_ids)
+                    .execute
+                )
+                
+                db_records = res.data if res.data else []
+                valid_status_map = {r["id"]: r for r in db_records if r.get("is_featured") and r.get("status") == "available"}
+                
+                # Check if all cached items are still featured and available
+                if len(valid_status_map) == len(cached_properties):
+                    logger.info("[CACHE HIT & VALIDATED] Returning fresh featured properties.")
+                    return cached_result
+                else:
+                    logger.info("[CACHE INVALIDATION] Cached featured properties contain outdated or rented items. Refreshing...")
+        except Exception as cache_err:
+            logger.warning(f"[CACHE VALIDATION ERROR] Falling back to fresh fetch: {str(cache_err)}")
 
     logger.info("[FEATURED EXECUTION] Fetching from database...")
 
     try:
-        # Fetch properties where is_featured is TRUE
+        # Fetch properties where is_featured is TRUE and status is available
         res = await asyncio.to_thread(
             supabase_client.table("properties")
             .select("*")
             .eq("is_featured", True)
+            .eq("status", "available")
             .limit(limit)
             .execute
         )
@@ -249,11 +273,12 @@ async def get_featured_worker(limit: int=6) -> str:
         properties = res.data if res.data else []
         
         if not properties:
+            cache_set(cache_key, "[]", ttl_hours=3600)
             return "[]"
 
         result = json.dumps(properties)
         
-        # Cache for 1 hour as featured properties change less frequently
+        # Cache for 1 hour
         cache_set(cache_key, result, ttl_hours=3600) 
         return result
         
@@ -309,7 +334,7 @@ class GetPropertyDetailsInput(BaseModel):
 
 @tool("get_property_details_worker", args_schema=GetPropertyDetailsInput)
 async def get_property_details_worker(property_id: str) -> str:
-    """Retrieves full details for a specific property by ID."""
+    """Retrieves full details for a specific property by ID, including renter profile information if leased."""
     try:
         res = await asyncio.to_thread(
             supabase_client.table("properties")
@@ -322,11 +347,39 @@ async def get_property_details_worker(property_id: str) -> str:
         if not res.data:
             return json.dumps({"error": "Property not found."})
             
-        return json.dumps(res.data)
+        property_data = res.data
+        lease_id = property_data.get("lease_id")
+
+        # If a lease_id is present, fetch the lease to get the renter_id, then fetch the renter's profile
+        if lease_id:
+            lease_res = await asyncio.to_thread(
+                supabase_client.table("leases")
+                .select("renter_id")
+                .eq("id", lease_id)
+                .maybe_single()
+                .execute
+            )
+            
+            lease_data = lease_res.data if lease_res else None
+            renter_id = lease_data.get("renter_id") if lease_data else None
+
+            if renter_id:
+                profile_res = await asyncio.to_thread(
+                    supabase_client.table("profiles")
+                    .select("*")
+                    .eq("id", renter_id)
+                    .maybe_single()
+                    .execute
+                )
+                
+                if profile_res and profile_res.data:
+                    property_data["renter"] = profile_res.data
+
+        return json.dumps(property_data)
+        
     except Exception as e:
         logger.error(f"[GET DETAILS ERROR] {str(e)}")
         return json.dumps({"error": str(e)})
-
 
 class UpdatePropertyInput(BaseModel):
     property_id: str = Field(..., description="The ID of the property to update.")
