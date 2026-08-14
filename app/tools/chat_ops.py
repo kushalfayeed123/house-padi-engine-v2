@@ -278,21 +278,23 @@ async def get_messages_worker(
         return f"Messages retrieval failure: {str(e)}"
 
 
+
+
 @tool("list_threads_worker")
 async def list_threads_worker(config: RunnableConfig) -> str:
     """Lists all chat threads for the user.
-    
+
     - Shows all conversations
     - Displays last message and timestamp
     - Shows unread message count
     """
     user_id = config.get("configurable", {}).get("user_id")
-    
+
     if not user_id:
         return "Security Guardrail: User context missing."
 
     try:
-        # Get all threads user is part of
+        # 1. Fetch all threads the user participates in
         thread_res = await db.execute(
             supabase_client.table("chat_threads")
             .select("id, property_id, renter_id, owner_id, last_message_at")
@@ -300,46 +302,62 @@ async def list_threads_worker(config: RunnableConfig) -> str:
             .order("last_message_at", desc=True)
             .execute
         )
-        
-        threads = thread_res.data if thread_res.data else []
-        
-        # Enhance with property and unread info
+        threads = thread_res.data or []
+
+        if not threads:
+            return json.dumps([])
+
+        # 2. Batch-fetch related properties in a single query
+        property_ids = {t["property_id"] for t in threads if t.get("property_id")}
+        properties_by_id: dict = {}
+        if property_ids:
+            prop_res = await db.execute(
+                supabase_client.table("properties")
+                .select("id, title")
+                .in_("id", list(property_ids))
+                .execute
+            )
+            properties_by_id = {p["id"]: p for p in (prop_res.data or [])}
+
+        # 3. Batch-fetch counterpart user names (renter/owner) in a single query
+        counterpart_ids = {
+            (t["owner_id"] if user_id == t.get("renter_id") else t["renter_id"])
+            for t in threads
+        } - {None}
+        users_by_id: dict = {}
+        if counterpart_ids:
+            user_res = await db.execute(
+                supabase_client.table("profile")  # adjust table/column names as needed
+                .select("id, full_name")
+                .in_("id", list(counterpart_ids))
+                .execute
+            )
+            users_by_id = {u["id"]: u for u in (user_res.data or [])}
+
+        # 4. Assemble response with no further DB calls
         enhanced_threads = []
         for thread in threads:
             thread_info = {
                 "thread_id": thread.get("id"),
-                "last_message_at": thread.get("last_message_at")
+                "last_message_at": thread.get("last_message_at"),
             }
-            
-            # Add property info if available
-            if thread.get("property_id"):
-                prop_res = await db.execute(
-                    supabase_client.table("properties")
-                    .select("id, title")
-                    .eq("id", thread.get("property_id"))
-                    .single()
-                    .execute
-                )
-                if prop_res.data:
-                    thread_info["property"] = {
-                        "id": prop_res.data.get("id"),
-                        "title": prop_res.data.get("title")
-                    }
-            
-            # Determine other participant
-            if user_id == thread.get("renter_id"):
-                thread_info["other_participant"] = f"Landlord ({thread.get('owner_id')})"
-            else:
-                thread_info["other_participant"] = f"Renter ({thread.get('renter_id')})"
-            
+
+            prop = properties_by_id.get(thread.get("property_id"))
+            if prop:
+                thread_info["property"] = {"id": prop["id"], "title": prop.get("title")}
+
+            is_renter = user_id == thread.get("renter_id")
+            counterpart_id = thread.get("owner_id") if is_renter else thread.get("renter_id")
+            counterpart = users_by_id.get(counterpart_id)
+            role_label = "Landlord" if is_renter else "Renter"
+            name = counterpart.get("full_name") if counterpart else counterpart_id
+            thread_info["other_participant"] = f"{role_label} ({name})"
+
             enhanced_threads.append(thread_info)
-        
+
         logger.info(f"[THREADS LISTED] {len(enhanced_threads)} threads for user {user_id}")
-        
         return json.dumps(enhanced_threads)
-        
-    except Exception as e:
-        logger.error(f"[THREADS LISTING ERROR] {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return f"Threads listing failure: {str(e)}"
+
+    except Exception:
+        logger.exception(f"[THREADS LISTING ERROR] user {user_id}")
+        return "Threads listing failure: an internal error occurred."

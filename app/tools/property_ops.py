@@ -202,6 +202,7 @@ async def create_property_worker(
         
         # Invalidate cache so new property appears in searches immediately
         cache_invalidate("property_search:")
+       
         logger.info(f"[CACHE INVALIDATED] Property search cache cleared for new listing")
         
         return f"Success: Property '{title}' cataloged. Property ID: {property_id}. Landlord can now publish for renters to see."

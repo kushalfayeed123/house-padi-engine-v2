@@ -31,7 +31,7 @@ class ManageApplicationInput(BaseModel):
 
 
 @tool
-async def get_applications_worker(config: RunnableConfig) -> str:
+async def get_applications_worker(config: RunnableConfig, limit: int = 20, offset: int = 0) -> str:
     """Fetches lease/rental applications scoped by the caller's role — a
     landlord sees applications received for their properties, a renter
     sees applications they've submitted. Use this for requests like 'show
@@ -54,6 +54,7 @@ async def get_applications_worker(config: RunnableConfig) -> str:
                 .select("*, properties!inner(id, title, address_full, owner_id)")
                 .eq("properties.owner_id", user_id)
                 .order("applied_at", desc=True)
+                .range(offset, offset + limit - 1)
                 .execute
             )
         else:
@@ -63,6 +64,7 @@ async def get_applications_worker(config: RunnableConfig) -> str:
                 .select("*, properties(id, title, address_full)")
                 .eq("renter_id", user_id)
                 .order("applied_at", desc=True)
+                .range(offset, offset + limit - 1)
                 .execute
             )
 

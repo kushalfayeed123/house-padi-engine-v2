@@ -24,8 +24,8 @@ RUN uv sync --frozen --no-dev
 # 5. Place the virtual environment's binaries into the PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Expose the FastAPI port
+# Expose the FastAPI port (informative for Docker, Render maps dynamically)
 EXPOSE 8000
 
-# Run Uvicorn server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run Uvicorn server using shell form to dynamically evaluate Render's $PORT
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
