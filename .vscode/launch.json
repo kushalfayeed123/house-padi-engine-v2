@@ -3,8 +3,9 @@
   "configurations": [
     {
       "name": "FastAPI: Web Server",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "module": "uvicorn",
       "args": [
         "app.main:app",
@@ -18,8 +19,9 @@
     },
     {
       "name": "Python: Background Worker",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "program": "${workspaceFolder}/worker.py",
       "console": "integratedTerminal",
       "justMyCode": true
