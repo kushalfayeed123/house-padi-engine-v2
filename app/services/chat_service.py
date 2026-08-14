@@ -115,6 +115,18 @@ def _extract_entity_refs(msgs: List[Any]) -> Dict[str, List[dict]]:
     return refs
 
 
+def _extract_redirect_url(dynamic_data: Dict[str, Any]) -> Optional[str]:
+    """Surfaces a redirect_url from any tool called mid-conversation (e.g.
+    trigger_property_ui_worker) to the top level of the response.
+    Frontend clients only check the top-level `redirect_url` field, so
+    leaving it nested under data.<tool_name> makes it invisible to them —
+    it only worked previously for the separate INTENT_UI_MAP shortcut path."""
+    for tool_result in dynamic_data.values():
+        if isinstance(tool_result, dict) and tool_result.get("redirect_url"):
+            return tool_result["redirect_url"]
+    return None
+
+
 async def _load_cached_entity_refs(thread_id: str) -> Dict[str, List[dict]]:
     raw = await cache_get(f"entity_refs:{thread_id}")
     if not raw:
@@ -141,7 +153,7 @@ async def process_chat_message(
     user_role = user_context.get("role") if user_context else "renter"
 
     # 1. Intent-based UI redirect shortcut
-    detected_intent = dynamic_intent_router(message)
+    detected_intent = await dynamic_intent_router(message)
     if detected_intent in INTENT_UI_MAP:
         await save_message_to_db(thread_id=thread_id, content=message, is_ai_response=False, sender_id=user_id)
 
@@ -215,6 +227,10 @@ async def process_chat_message(
         await _save_cached_entity_refs(thread_id, merged_refs)
         logger.info(f"[CHAT_SERVICE] Updated entity refs for thread {thread_id}: {list(new_refs.keys())}")
 
+    # 6b. Surface any tool-provided redirect (e.g. trigger_property_ui_worker)
+    # at the top level — see _extract_redirect_url docstring.
+    redirect_url = _extract_redirect_url(dynamic_data)
+
     content = None
     for m in reversed(msgs):
         if getattr(m, "type", None) == "ai" and getattr(m, "content", None):
@@ -227,4 +243,10 @@ async def process_chat_message(
     if content:
         await save_message_to_db(thread_id=thread_id, content=content, is_ai_response=True, upsert_thread=False)
 
-    return {"type": "response", "content": content, "data": dynamic_data, "thread_id": thread_id }
+    return {
+        "type": "response",
+        "content": content,
+        "data": dynamic_data,
+        "thread_id": thread_id,
+        "redirect_url": redirect_url,
+    }

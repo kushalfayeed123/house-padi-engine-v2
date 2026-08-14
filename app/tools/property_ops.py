@@ -439,7 +439,7 @@ async def update_property_worker(property_id: str, update_data: Dict[str, Any], 
             .execute
         )
 
-        cache_invalidate("property_search:")
+        await cache_invalidate("property_search:")
         return f"Success: Property {property_id} updated and search index refreshed."
         
     except Exception as e:
@@ -448,8 +448,18 @@ async def update_property_worker(property_id: str, update_data: Dict[str, Any], 
     
     
 @tool("trigger_property_ui_worker")
-async def trigger_property_ui_worker() -> str:
+async def trigger_property_ui_worker(config: RunnableConfig) -> str:
     """Triggered when a user wants to create a new property or list a home."""
+    safe_config = config or {}
+    user_id = safe_config.get("configurable", {}).get("user_id")
+    user_role = safe_config.get("configurable", {}).get("user_role", "renter")
+
+    if not user_id:
+        return "Security Guardrail: Execution halted due to absent tenant identity context."
+
+    if user_role == "renter":
+        return "Security Guardrail: Operation denied. Renters are strictly unauthorized to create property listings."
+
     return json.dumps({
         "redirect_url": "/landlord/properties/new"
     })
