@@ -20,7 +20,11 @@ def get_model() -> SentenceTransformer:
             if _model is None:
                 logger.info("Initializing SentenceTransformer with lightweight ONNX backend...")
                 # Forces ONNX runtime instead of heavy PyTorch
-                _model = SentenceTransformer('all-MiniLM-L6-v2', backend="onnx")
+                _model = SentenceTransformer(
+                    'all-MiniLM-L6-v2',
+                    backend="onnx",
+                    model_kwargs={"file_name": "onnx/model.onnx"}
+                    )
                 logger.info("ONNX model successfully cached in memory global context.")
     return _model
 

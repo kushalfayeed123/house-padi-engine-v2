@@ -1,4 +1,3 @@
-import asyncio
 import os
 from contextlib import asynccontextmanager
 from logging import getLogger
@@ -9,31 +8,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 # Import your routes
-from app.routes import application_routes, auth_routes, landlord_routes, lease_routes, payment_routes, profile_routes, property_routes, chat_routes, tour_routes
-# Import model loader
-from app.services import property_cron
-from app.services.vector_service import get_model
+from app.routes import (
+    application_routes, auth_routes, landlord_routes, lease_routes, 
+    payment_routes, profile_routes, property_routes, chat_routes, tour_routes
+)
 
 logger = getLogger("uvicorn")
 load_dotenv()
 
 
-# 1. Define Container
 class SystemStateContainer:
-
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
 
 
-
-# 2. Define Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- STARTUP PHASE ---
     current_dir = Path(__file__).resolve().parent
     env_path = current_dir.parent / ".env"
     
-    # Load the environment variables
     if env_path.exists():
         load_dotenv(dotenv_path=env_path)
         logger.info(f"Loaded environment variables from {env_path}")
@@ -43,37 +37,20 @@ async def lifespan(app: FastAPI):
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-    logger.info("Initializing persistent Supabase Client...")
+    logger.info("Initializing persistent Supabase Client for Web API...")
 
     if supabase_url and supabase_key:
         supabase_client = create_client(supabase_url, supabase_key)
-        # Bind it to app.state.system to match your dependencies.py
         app.state.system = SystemStateContainer(supabase_client)
         app.state.supabase = supabase_client
 
+    # EXACTLY ONE YIELD separating startup from shutdown
+    yield  
 
-    sweep_task = asyncio.create_task(property_cron.run_pending_property_enrichment_sweep())
-    
-    yield  # This separates startup from shutdown
-    
-    # --- SHUTDOWN ACTIONS ---
-    # Gracefully cancel the background loop when the app stops
-    sweep_task.cancel()
-    try:
-        await sweep_task
-    except asyncio.CancelledError:
-        pass
-
-    # logger.info("Pre-warming semantic model memory...")
-    # get_model()
-
-    yield 
-    
     # --- SHUTDOWN PHASE ---
-    logger.info("Tearing down service resources cleanly...")
+    logger.info("Tearing down web service resources cleanly...")
 
 
-# 3. Initialize App
 app = FastAPI(
     title="HousePadi Enterprise Core Gateway",
     version="1.0.0",
@@ -89,7 +66,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 4. Register Routes
+# Register Routes
 app.include_router(auth_routes.router)
 app.include_router(property_routes.router)
 app.include_router(chat_routes.router)
@@ -108,5 +85,3 @@ async def root_health_check():
         "service": "HousePadi Backend Engine",
         "version": "1.0.0"
     }
-
-
