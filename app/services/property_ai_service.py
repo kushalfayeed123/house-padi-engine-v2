@@ -75,13 +75,14 @@ class PropertyAIService:
 
     async def generate_embedding(self, text: str) -> list[float]:
         """
-        Safely generates embeddings by fetching the singleton model lazily 
-        and offloading CPU-bound tensor encoding to a background thread pool.
+        Safely generates embeddings using the ONNX backend by fetching 
+        the singleton model lazily and offloading CPU-bound encoding to a thread pool.
         """
         def _encode_sync(content: str):
-            model = get_model()  # Lazy-loaded on first call
-            tensor = model.encode(content, convert_to_tensor=True)
-            return tensor.cpu().tolist()
+            model = get_model()  # Lazy-loaded ONNX model
+            # ONNX returns a numpy array directly; convert straight to a python list
+            embedding = model.encode(content)
+            return embedding.tolist()
 
         return await asyncio.to_thread(_encode_sync, text)
 
