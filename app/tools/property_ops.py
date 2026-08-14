@@ -16,23 +16,43 @@ logger = getLogger("uvicorn")
 # ==========================================
 
 
+
 class SearchPropertiesInput(BaseModel):
     location: str = Field(..., description="The city or district to search in.")
     base_price: Optional[float] = Field(None, description="Max budget for the property.")
     bedrooms: Optional[int] = Field(None, description="Number of bedrooms.")
 
+    @field_validator("base_price", mode="before")
+    @classmethod
+    def parse_shorthand_price(cls, value):
+        if isinstance(value, str):
+            val_str = value.strip().upper()
+            multiplier = 1.0
 
-@tool("search_properties_worker")
-async def search_properties_worker(location: str, base_price: Optional[float] = None, bedrooms: Optional[int] = None) -> str:
+            if val_str.endswith("M"):
+                multiplier = 1_000_000.0
+                val_str = val_str[:-1]
+            elif val_str.endswith("K"):
+                multiplier = 1_000.0
+                val_str = val_str[:-1]
+
+            try:
+                return float(val_str) * multiplier
+            except ValueError:
+                raise ValueError(f"Unable to parse price string: {value}")
+        return value
+
+
+@tool("search_properties_worker", args_schema=SearchPropertiesInput)
+async def search_properties_worker(
+    location: str,
+    base_price: Optional[float] = None,
+    bedrooms: Optional[int] = None,
+) -> str:
     """Finds available rental properties, apartments, or houses matching a
-    location and optional filters like bedroom count or max price. Use
-    this whenever someone is looking for, searching for, or asking about
-    places to rent — for example: 'find me a 2 bedroom apartment in
-    Lekki', 'show me houses in Abuja under 2 million', 'search for a flat
-    near Unilag', 'what properties do you have in Jos', '3 bedroom in
-    Port Harcourt'."""
+    location and optional filters like bedroom count or max price."""
 
-    # === CACHE CHECK (avoid redundant embedding + RPC calls) ===
+    # === CACHE CHECK ===
     cache_payload = {
         "location": (location or "").strip().lower(),
         "base_price": base_price,
@@ -51,22 +71,25 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
     # 2. Call Supabase RPC
     try:
         res = await asyncio.to_thread(
-            lambda: supabase_client.rpc("match_properties", {
-                "query_embedding": query_vector, # List of floats from your embedding model (or None)
-                "match_threshold": 0.25,
-                "match_count": 20,
-                "filter_owner_id": None,
-                "budget_limit": base_price,
-                "filters": {
-                    "bedrooms": bedrooms,
-                    "location": location,
-                    "status": "available"
+            lambda: supabase_client.rpc(
+                "match_properties",
+                {
+                    "query_embedding": query_vector,
+                    "match_threshold": 0.25,
+                    "match_count": 20,
+                    "filter_owner_id": None,
+                    "budget_limit": base_price,
+                    "filters": {
+                        "bedrooms": bedrooms,
+                        "location": location,
+                        "status": "available",
+                    },
+                    "lat": None,
+                    "lng": None,
+                    "radius_km": 5,
+                    "tags": [],
                 },
-                "lat": None,
-                "lng": None,
-                "radius_km": 5,
-                "tags": []
-            }).execute()
+            ).execute()
         )
 
         if not res.data or not isinstance(res.data, list):
@@ -74,28 +97,29 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
             await cache_set(cache_key, empty_result, ttl_hours=1)
             return empty_result
 
-        sanitized = [{
-            "id": item.get("id"),
-            "title": item.get("title"),
-            "address": item.get("address"),
-            "location": item.get("location"),
-            "price": item.get("price"),
-            "bedrooms": item.get("bedrooms"),
-            "bathrooms": item.get("bathrooms"),
-            "amenities": item.get("amenities"),
-            "images": item.get("images", []),
-            "similarity": item.get("similarity")
-        } for item in res.data if isinstance(item, dict)]
+        sanitized = [
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "address": item.get("address"),
+                "location": item.get("location"),
+                "price": item.get("price"),
+                "bedrooms": item.get("bedrooms"),
+                "bathrooms": item.get("bathrooms"),
+                "amenities": item.get("amenities"),
+                "images": item.get("images", []),
+                "similarity": item.get("similarity"),
+            }
+            for item in res.data
+            if isinstance(item, dict)
+        ]
 
         result = json.dumps(sanitized)
-        # Listings shift throughout the day — short TTL, not the 24h default
         await cache_set(cache_key, result, ttl_hours=1)
         return result
 
     except Exception as e:
-        # Don't cache errors — a transient RPC failure shouldn't get "stuck"
         return json.dumps({"error": str(e)})
-
 
 # ==========================================
 # 2. CREATE / CATALOG TOOL (SCHEMA-ALIGNED)
