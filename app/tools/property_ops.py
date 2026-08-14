@@ -40,7 +40,7 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
     }
     cache_key = _generate_cache_key("property_search", cache_payload)
 
-    cached_result = cache_get(cache_key)
+    cached_result = await cache_get(cache_key)
     if cached_result:
         logger.info(f"[CACHE HIT] search_properties_worker: {location}")
         return cached_result
@@ -71,7 +71,7 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
 
         if not res.data or not isinstance(res.data, list):
             empty_result = json.dumps([])
-            cache_set(cache_key, empty_result, ttl_hours=1)
+            await cache_set(cache_key, empty_result, ttl_hours=1)
             return empty_result
 
         sanitized = [{
@@ -89,7 +89,7 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
 
         result = json.dumps(sanitized)
         # Listings shift throughout the day — short TTL, not the 24h default
-        cache_set(cache_key, result, ttl_hours=1)
+        await cache_set(cache_key, result, ttl_hours=1)
         return result
 
     except Exception as e:
