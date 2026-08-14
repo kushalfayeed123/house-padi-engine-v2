@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from app.core.database import db, supabase_client
 from app.services.cache_service import _generate_cache_key, cache_get, cache_invalidate, cache_set
-from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query, vectorize_search_query_async
+from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query_async
 from pydantic import BaseModel, Field, field_validator
 from logging import getLogger
 
@@ -62,8 +62,19 @@ async def search_properties_worker(
 
     cached_result = await cache_get(cache_key)
     if cached_result:
-        logger.info(f"[CACHE HIT] search_properties_worker: {location}")
-        return cached_result
+        try:
+            parsed_cache = json.loads(cached_result)
+            if isinstance(parsed_cache, list) and len(parsed_cache) == 0:
+                logger.info(
+                    f"[CACHE INVALIDATE] Empty result cached for {location}."
+                    " Bypassing cache to fetch fresh results."
+                )
+            else:
+                logger.info(f"[CACHE HIT] search_properties_worker: {location}")
+                return cached_result
+        except json.JSONDecodeError:
+            logger.info(f"[CACHE HIT] search_properties_worker: {location}")
+            return cached_result
 
     # 1. Vectorize query
     query_vector = await vectorize_search_query_async(location, bedrooms)

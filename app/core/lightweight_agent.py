@@ -171,7 +171,21 @@ TOOL_UI_FALLBACKS: Dict[str, ToolUIFallback] = {
 }
 
 
+UI_FALLBACK_TOOL_NAME = "ui_fallback_worker"
+
+
 def _build_ui_fallback_message(call: ToolCall, fallback: ToolUIFallback) -> Tuple[str, ToolMessage]:
+    """
+    Builds the synthetic tool result the frontend renders as a fallback
+    widget (calendar picker, lease signer, etc).
+
+    The ToolMessage name is always the fixed UI_FALLBACK_TOOL_NAME — never
+    derived from fallback.action — so _clean_tool_key always resolves it
+    to the same `data.ui_fallback` key regardless of which fallback fired.
+    The frontend discriminates which widget to render using payload["action"]
+    (e.g. "book_tour" vs "lease_ui"), which was already being sent — it just
+    used to be redundantly (and inconsistently) baked into the key name too.
+    """
     args = call.get("args") or {}
     payload: Dict[str, Optional[str]] = {"ui_component": fallback.ui_component, "action": fallback.action}
     for field_name in fallback.passthrough_fields:
@@ -184,7 +198,7 @@ def _build_ui_fallback_message(call: ToolCall, fallback: ToolUIFallback) -> Tupl
     tool_msg = ToolMessage(
         content=json.dumps(payload),
         tool_call_id=call["id"],
-        name=f"{fallback.action}_ui_worker",
+        name=UI_FALLBACK_TOOL_NAME,
     )
     return fallback.prompt_message, tool_msg
 

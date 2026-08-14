@@ -10,7 +10,7 @@ from supabase import create_client, Client
 # Import your routes (ensure these also don't load heavy AI models at module top-level!)
 from app.routes import (
     application_routes, auth_routes, landlord_routes, lease_routes, 
-    payment_routes, profile_routes, property_routes, chat_routes, tour_routes
+    payment_routes, profile_routes, property_routes, chat_routes, renter_routes, tour_routes
 )
 
 logger = getLogger("uvicorn")
@@ -76,6 +76,7 @@ app.include_router(application_routes.router)
 app.include_router(lease_routes.router)
 app.include_router(payment_routes.router)
 app.include_router(landlord_routes.router)
+app.include_router(renter_routes.router)
 
 
 @app.get("/")
