@@ -64,8 +64,8 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    logger.info("Pre-warming semantic model memory...")
-    get_model()
+    # logger.info("Pre-warming semantic model memory...")
+    # get_model()
 
     yield 
     
