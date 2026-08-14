@@ -10,8 +10,16 @@ from langchain_core.messages import BaseMessage, convert_to_messages, trim_messa
 
 
 def _rough_token_len(messages) -> int:
-    """Conservative ~4 chars/token estimate — no official Groq/Llama tokenizer available."""
-    total_chars = sum(len(str(m.content)) for m in messages)
+    """Conservative ~4 chars/token estimate handling string, list, or dict content."""
+    total_chars = 0
+    for m in messages:
+        content = getattr(m, "content", m)
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            total_chars += sum(len(str(item)) for item in content)
+        else:
+            total_chars += len(str(content))
     return total_chars // 4
 
 

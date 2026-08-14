@@ -10,11 +10,14 @@ logger = logging.getLogger("uvicorn")
 
 class PropertyAIService:
     def __init__(self):
-        self.model = get_model()
+        # Do NOT call get_model() here! It causes immediate memory spikes on startup.
         supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_KEY")
+        # Fallback to service role key if SUPABASE_KEY isn't set separately
+        supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        
         if not supabase_url or not supabase_key:
-            raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
+            raise ValueError("SUPABASE_URL and Supabase key environment variables must be set")
+        
         self.supabase = create_client(supabase_url, supabase_key)
 
     async def analyze_property(self, title: str, description: str, location: str | None) -> dict:
@@ -71,9 +74,16 @@ class PropertyAIService:
             return fallback
 
     async def generate_embedding(self, text: str) -> list[float]:
-        # Generate embedding tensor and convert to list for Supabase vector column
-        embedding_tensor = self.model.encode(text, convert_to_tensor=True)
-        return embedding_tensor.cpu().tolist()
+        """
+        Safely generates embeddings by fetching the singleton model lazily 
+        and offloading CPU-bound tensor encoding to a background thread pool.
+        """
+        def _encode_sync(content: str):
+            model = get_model()  # Lazy-loaded on first call
+            tensor = model.encode(content, convert_to_tensor=True)
+            return tensor.cpu().tolist()
+
+        return await asyncio.to_thread(_encode_sync, text)
 
     async def enrich_property(self, property_id: str):
         # 1. Fetch property from Supabase
@@ -97,7 +107,7 @@ class PropertyAIService:
 
         logger.info(f"Enriching property {property_id}...")
 
-        # 2. Run AI Analysis & Embedding generation
+        # 2. Run AI Analysis & Embedding generation concurrently or sequentially
         ai_result = await self.analyze_property(title, description, location)
         text_to_embed = f"Title: {title}. Location: {location}. Address: {address_full}. Description: {description}"
         embedding = await self.generate_embedding(text_to_embed)
@@ -112,13 +122,12 @@ class PropertyAIService:
             "metadata": updated_metadata,
             "features": ai_result.get("features", {}),
             "embedding": embedding,
-            "status": "available",  # Updates status from draft/pending to available
+            "status": "available",
             "aiSummary": ai_result.get("ai_summary", title),
         }
 
         self.supabase.table("properties").update(update_data).eq("id", property_id).execute()
         logger.info(f"✅ Property {property_id} successfully enriched.")
-        
         
     async def run_enrichment_sweep(self):
         """Background sweep loop that periodically checks for properties whose status is not available."""

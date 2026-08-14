@@ -1,22 +1,23 @@
 import asyncio
 import logging
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
-from sentence_transformers import SentenceTransformer
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# Global model instance for singleton lifecycle execution caching
-_model: SentenceTransformer | None = None
+# Global model instance typed safely without importing heavy libraries at startup
+_model: Any = None
 # Explicit thread lock to prevent concurrent initialization race conditions from asyncio.to_thread
 _model_lock = threading.Lock()
 
 
-def get_model() -> SentenceTransformer:
+def get_model():
     """
     Retrieves the global cached SentenceTransformer model instance (Singleton).
-    Guarantees thread-safe access so weights are loaded into memory exactly once.
+    Guarantees thread-safe access and lazy-loads PyTorch/weights only on first use to prevent OOM.
     """
     global _model
     
@@ -24,7 +25,8 @@ def get_model() -> SentenceTransformer:
     if _model is None:
         with _model_lock:
             if _model is None:
-                logger.info("Initializing SentenceTransformer model 'all-MiniLM-L6-v2' thread-safely...")
+                logger.info("Importing and initializing SentenceTransformer model 'all-MiniLM-L6-v2'...")
+                from sentence_transformers import SentenceTransformer
                 _model = SentenceTransformer('all-MiniLM-L6-v2')
                 logger.info("SentenceTransformer model successfully cached in memory global context.")
     return _model
