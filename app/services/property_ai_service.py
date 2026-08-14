@@ -4,13 +4,12 @@ import logging
 import os
 import httpx
 from supabase import create_client
-from app.services.vector_service import get_model
+from app.services.vector_service import embed_text_async
 
 logger = logging.getLogger("uvicorn")
 
 class PropertyAIService:
     def __init__(self):
-        # Do NOT call get_model() here! It causes immediate memory spikes on startup.
         supabase_url = os.getenv("SUPABASE_URL")
         # Fallback to service role key if SUPABASE_KEY isn't set separately
         supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -75,16 +74,12 @@ class PropertyAIService:
 
     async def generate_embedding(self, text: str) -> list[float]:
         """
-        Safely generates embeddings using the ONNX backend by fetching 
-        the singleton model lazily and offloading CPU-bound encoding to a thread pool.
+        Generates an embedding via OpenRouter's hosted embeddings API instead
+        of a locally-loaded model — keeps this process's memory footprint
+        small enough to run comfortably on memory-constrained hosts (e.g.
+        Render's 512MB free tier).
         """
-        def _encode_sync(content: str):
-            model = get_model()  # Lazy-loaded ONNX model
-            # ONNX returns a numpy array directly; convert straight to a python list
-            embedding = model.encode(content)
-            return embedding.tolist()
-
-        return await asyncio.to_thread(_encode_sync, text)
+        return await embed_text_async(text)
 
     async def enrich_property(self, property_id: str):
         # 1. Fetch property from Supabase

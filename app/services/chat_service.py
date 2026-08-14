@@ -115,8 +115,8 @@ def _extract_entity_refs(msgs: List[Any]) -> Dict[str, List[dict]]:
     return refs
 
 
-def _load_cached_entity_refs(thread_id: str) -> Dict[str, List[dict]]:
-    raw = cache_get(f"entity_refs:{thread_id}")
+async def _load_cached_entity_refs(thread_id: str) -> Dict[str, List[dict]]:
+    raw = await cache_get(f"entity_refs:{thread_id}")
     if not raw:
         return {}
     try:
@@ -125,8 +125,8 @@ def _load_cached_entity_refs(thread_id: str) -> Dict[str, List[dict]]:
         return {}
 
 
-def _save_cached_entity_refs(thread_id: str, refs: Dict[str, List[dict]]) -> None:
-    cache_set(f"entity_refs:{thread_id}", json.dumps(refs), ttl_hours=ENTITY_REFS_TTL_HOURS)
+async def _save_cached_entity_refs(thread_id: str, refs: Dict[str, List[dict]]) -> None:
+    await cache_set(f"entity_refs:{thread_id}", json.dumps(refs), ttl_hours=ENTITY_REFS_TTL_HOURS)
 
 
 async def process_chat_message(
@@ -181,7 +181,7 @@ async def process_chat_message(
     # so it never appears in anyone's visible chat history, only in what
     # the model itself sees this call. Placed just before the newest user
     # message so it reads as relevant context for the current question.
-    cached_refs = _load_cached_entity_refs(thread_id)
+    cached_refs = await _load_cached_entity_refs(thread_id)
     if cached_refs:
         ref_message = {
             "role": "system",
@@ -212,7 +212,7 @@ async def process_chat_message(
     new_refs = _extract_entity_refs(msgs)
     if new_refs:
         merged_refs = {**cached_refs, **new_refs}  # new results for a key fully replace stale ones for that key
-        _save_cached_entity_refs(thread_id, merged_refs)
+        await _save_cached_entity_refs(thread_id, merged_refs)
         logger.info(f"[CHAT_SERVICE] Updated entity refs for thread {thread_id}: {list(new_refs.keys())}")
 
     content = None

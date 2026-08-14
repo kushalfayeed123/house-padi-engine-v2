@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from app.core.database import db, supabase_client
 from app.services.cache_service import _generate_cache_key, cache_get, cache_invalidate, cache_set
-from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query
+from app.services.vector_service import  vectorize_property_data_async, vectorize_search_query, vectorize_search_query_async
 from pydantic import BaseModel, Field, field_validator
 from logging import getLogger
 
@@ -38,7 +38,6 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
         "base_price": base_price,
         "bedrooms": bedrooms,
     }
-    cache_invalidate("property_search")  # Invalidate old cache entries for search
     cache_key = _generate_cache_key("property_search", cache_payload)
 
     cached_result = cache_get(cache_key)
@@ -47,7 +46,7 @@ async def search_properties_worker(location: str, base_price: Optional[float] = 
         return cached_result
 
     # 1. Vectorize query
-    query_vector = await asyncio.to_thread(vectorize_search_query, location, bedrooms)
+    query_vector = await vectorize_search_query_async(location, bedrooms)
 
     # 2. Call Supabase RPC
     try:
@@ -201,7 +200,7 @@ async def create_property_worker(
         property_id = res.data[0].get('id')
         
         # Invalidate cache so new property appears in searches immediately
-        cache_invalidate("property_search:")
+        await cache_invalidate("property_search:")
        
         logger.info(f"[CACHE INVALIDATED] Property search cache cleared for new listing")
         
@@ -222,7 +221,6 @@ class GetFeaturedInput(BaseModel):
 
 
 @tool("get_featured_worker", args_schema=GetFeaturedInput)
-@tool("get_featured_worker", args_schema=GetFeaturedInput)
 async def get_featured_worker(limit: int = 6) -> str:
     """
     Retrieves the curated list of featured properties for the HousePadi marketplace.
@@ -231,7 +229,7 @@ async def get_featured_worker(limit: int = 6) -> str:
     cache_key = "featured_properties"
     
     # === CACHE CHECK & VALIDATION ===
-    cached_result = cache_get(cache_key)
+    cached_result = await cache_get(cache_key)
     if cached_result:
         try:
             cached_properties = json.loads(cached_result)
@@ -274,13 +272,13 @@ async def get_featured_worker(limit: int = 6) -> str:
         properties = res.data if res.data else []
         
         if not properties:
-            cache_set(cache_key, "[]", ttl_hours=3600)
+            await cache_set(cache_key, "[]", ttl_hours=1)
             return "[]"
 
         result = json.dumps(properties)
         
         # Cache for 1 hour
-        cache_set(cache_key, result, ttl_hours=3600) 
+        await cache_set(cache_key, result, ttl_hours=1) 
         return result
         
     except Exception as e:

@@ -27,4 +27,5 @@ dependencies = [
     "langchain-ollama>=1.1.0",
     "python-multipart>=0.0.32",
     "reportlab>=5.0.0",
+    "upstash-redis>=1.7.0",
 ]
