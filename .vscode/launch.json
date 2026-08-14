@@ -16,24 +16,6 @@
         "--reload"
       ],
       "justMyCode": true
-    },
-    {
-      "name": "Python: Background Worker",
-      "type": "debugpy",
-      "request": "launch",
-      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
-      "program": "${workspaceFolder}/worker.py",
-      "console": "integratedTerminal",
-      "justMyCode": true
-    }
-  ],
-  "compounds": [
-    {
-      "name": "Full Stack: Web + Worker",
-      "configurations": [
-        "FastAPI: Web Server",
-        "Python: Background Worker"
-      ]
     }
   ]
 }

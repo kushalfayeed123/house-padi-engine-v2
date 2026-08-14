@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
+from app.services import property_cron
+from fastapi import APIRouter, Header, HTTPException, status
 
 # Import your routes
 from app.routes import (
@@ -85,3 +87,20 @@ async def root_health_check():
         "service": "HousePadi Backend Engine",
         "version": "1.0.0"
     }
+    
+
+router = APIRouter(prefix="/api/internal", tags=["Internal"])
+
+@router.post("/run-enrichment")
+async def run_enrichment(x_internal_secret: str = Header(None)):
+    # Secure the endpoint so only your cron scheduler can trigger it
+    expected_secret = os.getenv("INTERNAL_CRON_SECRET", "house-padi-super-secret")
+    if x_internal_secret != expected_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    
+    try:
+        # Execute your vectorization and AI enrichment sweep
+        await property_cron.run_pending_property_enrichment_sweep()
+        return {"status": "success", "message": "AI enrichment sweep completed."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
