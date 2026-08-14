@@ -71,6 +71,15 @@ def _clean_specs(specs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {k: v for k, v in (specs or {}).items() if v is not None}
 
 
+async def embed_texts_async(texts: List[str]) -> List[List[float]]:
+    """Batch variant of embed_text_async — one HTTP call for many inputs,
+    used for the intent-prototype phrase set."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(OPENROUTER_EMBEDDINGS_URL, headers=_headers(), json=_payload(texts))
+        response.raise_for_status()
+        data = response.json()
+        return [item["embedding"] for item in data["data"]]
+
 async def vectorize_property_data_async(address: str, ownerId: str, location: str, specs: Dict[str, Any]) -> List[float]:
     """Async: property listing fields -> embedding."""
     clean_specs = _clean_specs(specs)
