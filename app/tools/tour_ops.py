@@ -42,36 +42,37 @@ async def book_tour_worker(
         return "Security Guardrail: Request denied. User context missing."
 
     try:
-        # 1. Fetch the renter's profile details
+        # 1. Fetch the renter's profile details safely
         profile_res = await db.execute(
             supabase_client.table("profiles")
             .select("first_name, last_name, phone_number, email")
             .eq("id", user_id)
-            .single()
             .execute
         )
         
-        if not profile_res.data:
+        if not profile_res or not profile_res.data or len(profile_res.data) == 0:
             return "Execution Error: Authenticated profile record could not be located."
             
-        renter_first_name = profile_res.data.get("first_name", "")
-        renter_last_name = profile_res.data.get("last_name", "")
-        renter_email = profile_res.data.get("email", "")
-        renter_phone = profile_res.data.get("phone_number", "No Contact")
+        profile_data = profile_res.data[0]
+        renter_first_name = profile_data.get("first_name", "")
+        renter_last_name = profile_data.get("last_name", "")
+        renter_email = profile_data.get("email", "")
+        renter_phone = profile_data.get("phone_number", "No Contact")
         visitor_name = f"{renter_first_name} {renter_last_name}".strip()
 
-        # 2. Fetch property details (including coordinates for directions)
+        # 2. Fetch property details safely (avoiding single-row coercion errors)
         property_res = await db.execute(
             supabase_client.table("properties")
             .select("id, title, address_full, location, owner_id, coords")
             .eq("id", property_id)
-            .single()
             .execute
         )
         
-        if not property_res.data:
+        if not property_res or not property_res.data or len(property_res.data) == 0:
             return f"Execution Error: Property {property_id} not found."
         
+        property_data = property_res.data[0]
+
         if not tour_date:
             return json.dumps({
                 "status": "awaiting_datetime",
@@ -80,7 +81,6 @@ async def book_tour_worker(
                 "message": "Please choose a preferred date and time."
             })
         
-        property_data = property_res.data
         owner_id = property_data.get("owner_id")
         address_full = property_data.get("address_full", "")
         
@@ -107,7 +107,7 @@ async def book_tour_worker(
         
         logger.info(f"[TOUR BOOKED] Tour {tour_id} scheduled for {tour_date}. Awaiting landlord approval.")
         
-        # 4. Create notification for landlord (would trigger in real implementation)
+        # 4. Create notification for landlord
         notification_payload = {
             "user_id": owner_id,
             "title": "tour_request",
@@ -133,7 +133,6 @@ async def book_tour_worker(
         import traceback
         traceback.print_exc()
         return f"Database Interface Exception: {str(e)}"
-
 
 @tool("list_tours_worker")
 async def list_tours_worker(config: RunnableConfig) -> str:

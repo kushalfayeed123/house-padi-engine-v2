@@ -3,10 +3,18 @@ INTENT_PROTOTYPES = {
     "TRIGGER_DASHBOARD_UI": ["view my tours", "see my applications", "view my properties", "my dashboard", "check my listings", "my bookings", "view tours"],
     "property-specialist": ["search for houses", "find an apartment", "show me listings"],
     "tour-specialist": ["book a tour", "schedule a visit", "see the place"],
-    "lease-specialist": ["sign lease agreement", "contract terms", "lease application"],
+    "lease-specialist": ["sign lease agreement", "view contract terms", "update lease terms", "sign my lease", "view my active lease"],
     "payment-specialist": ["pay rent", "transfer money", "check wallet balance"],
     "kyc-specialist": ["verify identity", "upload id", "kyc status"],
-    "chat-specialist": ["message landlord", "contact owner", "start a chat"]
+    "chat-specialist": ["message landlord", "contact owner", "start a chat"],
+    "supervisor": [
+        "how does this work",
+        "can you explain how a lease works",
+        "what are the rules here",
+        "tell me about the platform",
+        "hello",
+        "what can you do",
+    ],
 }
 
 INTENT_UI_MAP = {

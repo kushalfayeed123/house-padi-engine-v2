@@ -17,6 +17,7 @@ from langchain_groq import ChatGroq
 from pydantic import SecretStr
 from sentence_transformers import SentenceTransformer
 
+from app.core.intent_transformer import dynamic_intent_router
 from app.services.token_budget import trim_conversation_history, budget_for_model
 
 from app.tools.application_lease_ops import manage_application_worker, submit_application_worker
@@ -40,7 +41,7 @@ WRITE_TOOLS = {
 
 LIGHTWEIGHT_MODEL_NAME = "llama-3.1-8b-instant"
 
-LIGHTWEIGHT_SYSTEM_PROMPT = """You are the friendly and helpful HousePadi Agent. Help renters and landlords directly — call the right tool for the request.
+LIGHTWEIGHT_SYSTEM_PROMPT = """You are the friendly and helpful HousePadi Agent. Help renters and landlords directly — call the right tool for the request when appropriate, while maintaining natural, open-ended conversational flow.
 
 RULES:
 - Never fabricate a property_id UUID; if you need one and don't have it, call search_properties_worker first.
@@ -55,6 +56,7 @@ RULES:
   - Omit the tour_date argument entirely.
   - The application will automatically display a calendar/date picker when tour_date is omitted.
 CONVERSATION GUIDELINES:
+- Engage naturally: warmly greet users, handle small talk, answer general questions about HousePadi, and guide users smoothly without forcing premature tool execution unless their intent clearly calls for it.
 - If required info is missing for a tool OTHER than book_tour_worker, ask specifically for THAT missing
   field — don't default to asking about location unless location is actually what's missing.
 - If a tool returns no results, explain that clearly to the user.
@@ -214,10 +216,73 @@ def is_valid_uuid(val: object) -> bool:
     if not val or not isinstance(val, str):
         return False
     try:
-        uuid.UUID(val)
+        parsed = uuid.UUID(val)
+        val_lower = val.lower()
+        # Reject common LLM mock/placeholder patterns
+        if "12345678" in val_lower or parsed.int == 0:
+            return False
         return True
     except (ValueError, AttributeError):
         return False
+
+
+def _arg_is_grounded_in_conversation(field_name: str, value: object, messages: List[dict]) -> bool:
+    if _is_empty_value(value):
+        return False
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+
+        if is_valid_uuid(text):
+            # A UUID must actually appear somewhere in the conversation history (e.g., search results)
+            for msg in messages:
+                content = ""
+                if isinstance(msg, dict):
+                    content = str(msg.get("content", ""))
+                else:
+                    content = str(getattr(msg, "content", ""))
+                
+                if text in content:
+                    return True
+            return False  # UUID is syntactically valid but never came from search results/history
+
+        user_contents = []
+        for msg in reversed(messages):
+            if isinstance(msg, dict):
+                role = msg.get("role")
+                content = msg.get("content")
+            else:
+                role = getattr(msg, "type", None) or getattr(msg, "role", None)
+                content = getattr(msg, "content", None)
+
+            if role in ("user", "human") and isinstance(content, str):
+                user_contents.append(content)
+                if len(user_contents) >= 3:
+                    break
+
+        if _looks_like_datetime_field(field_name):
+            latest_user_content = user_contents[0] if user_contents else ""
+            has_date_match = bool(_DATETIME_RE.search(latest_user_content))
+            has_time_match = bool(_SPECIFIC_TIME_RE.search(latest_user_content))
+
+            if not has_date_match:
+                return False
+
+            has_specific_time_in_val = bool(re.search(r"\b\d{1,2}:\d{2}\b|T\d{2}:\d{2}", text))
+            if has_specific_time_in_val and not has_time_match:
+                return False
+
+            return True
+
+        lowered = text.lower()
+        for content in user_contents:
+            if lowered in content.lower():
+                return True
+        return False
+
+    return True
 
 
 def try_rule_based_search(text: str, top_tool: BaseTool) -> Optional[dict]:
@@ -303,58 +368,6 @@ def _tool_requires_user_context(tool: BaseTool) -> bool:
 def _is_empty_value(value: object) -> bool:
     return value in (None, "", [], {}, set())
 
-
-def _arg_is_grounded_in_conversation(field_name: str, value: object, messages: List[dict]) -> bool:
-    if _is_empty_value(value):
-        return False
-
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return False
-
-        if is_valid_uuid(text):
-            return True
-
-        user_contents = []
-
-        for msg in reversed(messages):
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-            else:
-                role = getattr(msg, "type", None) or getattr(msg, "role", None)
-                content = getattr(msg, "content", None)
-
-            if role in ("user", "human") and isinstance(content, str):
-                user_contents.append(content)
-
-                if len(user_contents) >= 3:
-                    break
-
-        if _looks_like_datetime_field(field_name):
-            # Strictly validate datetime against the single latest user turn
-            latest_user_content = user_contents[0] if user_contents else ""
-
-            has_date_match = bool(_DATETIME_RE.search(latest_user_content))
-            has_time_match = bool(_SPECIFIC_TIME_RE.search(latest_user_content))
-
-            if not has_date_match:
-                return False
-
-            has_specific_time_in_val = bool(re.search(r"\b\d{1,2}:\d{2}\b|T\d{2}:\d{2}", text))
-            if has_specific_time_in_val and not has_time_match:
-                return False
-
-            return True
-
-        lowered = text.lower()
-        for content in user_contents:
-            if lowered in content.lower():
-                return True
-        return False
-
-    return True
 
 
 def _remove_ungrounded_datetime_args(args: dict, messages: List[dict]) -> dict:
@@ -464,12 +477,20 @@ async def invoke_lightweight_agent(
     last_user_msg = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
     )
+    
+    
+    intent = await dynamic_intent_router(last_user_msg)
+    is_informational = (intent == "supervisor")
 
     active_tools_with_scores = await select_tools_for_message(last_user_msg)
     active_tools = [t for t, _ in active_tools_with_scores]
     top_tool = active_tools_with_scores[0][0] if active_tools_with_scores else None
 
-    fast_path_args = try_rule_based_search(last_user_msg, top_tool) if top_tool else None
+    fast_path_args = None
+    
+    if not is_informational:
+        fast_path_args = try_rule_based_search(last_user_msg, top_tool) if top_tool else None
+        
     if fast_path_args:
         logger.info(f"[LIGHTWEIGHT] Fast-path search: {fast_path_args}")
         tool = cast(BaseTool, search_properties_worker)
@@ -517,12 +538,16 @@ async def invoke_lightweight_agent(
 
     logger.info(f"[LIGHTWEIGHT] Semantically selected tools: {[t.name for t in active_tools]}")
 
-    force_tool_name = _find_force_candidate(active_tools_with_scores)
-    if force_tool_name:
-        logger.info(f"[LIGHTWEIGHT] Forcing tool '{force_tool_name}' from ranked candidates")
-        dynamic_model = _lightweight_model.bind_tools(active_tools, tool_choice=force_tool_name)
+    if is_informational:
+        logger.info(f"[LIGHTWEIGHT] Informational query detected (intent: {intent}). Bypassing tool binding.")
+        dynamic_model = _lightweight_model
     else:
-        dynamic_model = _lightweight_model.bind_tools(active_tools)
+        force_tool_name = _find_force_candidate(active_tools_with_scores)
+        if force_tool_name:
+            logger.info(f"[LIGHTWEIGHT] Forcing tool '{force_tool_name}' from ranked candidates")
+            dynamic_model = _lightweight_model.bind_tools(active_tools, tool_choice=force_tool_name)
+        else:
+            dynamic_model = _lightweight_model.bind_tools(active_tools)
 
     try:
         response = await dynamic_model.ainvoke(full_messages, config=tool_config)

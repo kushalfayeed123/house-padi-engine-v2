@@ -41,7 +41,7 @@ async def get_renter_overview(config: dict = Depends(get_optional_user_context))
             .order("created_at", desc=True)
             .execute()
         )
-        tours = tour_res.data if tour_res.data else []
+        tours = tour_res.data if tour_res and tour_res.data else []
 
         # 2. Applications submitted by this renter
         app_res = await db.execute(
@@ -51,7 +51,7 @@ async def get_renter_overview(config: dict = Depends(get_optional_user_context))
             .order("applied_at", desc=True)
             .execute()
         )
-        applications = app_res.data if app_res.data else []
+        applications = app_res.data if app_res and app_res.data else []
         pending_applications = [
             a for a in applications if a.get("status") == "pending_landlord_approval"
         ]
@@ -73,7 +73,7 @@ async def get_renter_overview(config: dict = Depends(get_optional_user_context))
             .maybe_single()
             .execute()
         )
-        wallet_balance = wallet_res.data.get("balance", 0) if wallet_res.data else 0
+        wallet_balance = wallet_res.data.get("balance", 0) if wallet_res and wallet_res.data else 0
 
         return {
             "status": "success",
