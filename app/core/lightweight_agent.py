@@ -1,31 +1,29 @@
-import asyncio
 import inspect
 import json
 import logging
 import os
 import re
-import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, cast
 import uuid
 
-import numpy as np
 from langchain_core.messages import AIMessage, ToolCall, ToolMessage, convert_to_messages
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_groq import ChatGroq
 from pydantic import SecretStr
-from sentence_transformers import SentenceTransformer
 
 from app.core.intent_transformer import dynamic_intent_router
 from app.services.token_budget import trim_conversation_history, budget_for_model
 
+from app.services.vector_service import embed_text_async, embed_texts_async
 from app.tools.application_lease_ops import manage_application_worker, submit_application_worker
 from app.tools.property_ops import create_property_worker, search_properties_worker, trigger_property_ui_worker
 from app.tools.tour_ops import book_tour_worker, list_tours_worker, \
     manage_tour_request_worker
-from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
-from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker
+    
+from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker, trigger_payment_ui_worker
+from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker, trigger_kyc_ui_worker
 from app.tools.chat_ops import create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker
 
 logger = logging.getLogger("uvicorn")
@@ -61,14 +59,19 @@ CONVERSATION GUIDELINES:
   field — don't default to asking about location unless location is actually what's missing.
 - If a tool returns no results, explain that clearly to the user.
 - ALWAYS respond in complete, conversational sentences. NEVER reply with single words like "Done." or "Okay."
+- If a message mixes a read-only check (balance, verification status) with an action request
+  (making a payment, uploading ID), you can only take one step per turn — answer the checkable
+  part first using the relevant tool, then explicitly ask if they'd like you to open the
+  payment/verification page next, rather than silently acting on or silently dropping either half.
+
 """
 
 ALL_TOOLS: List[BaseTool] = [
     search_properties_worker, trigger_property_ui_worker,
     book_tour_worker, list_tours_worker, manage_tour_request_worker,
     manage_application_worker, submit_application_worker,
-    get_wallet_balance_worker, process_payment_worker, split_payment_worker,
-    submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker,
+    get_wallet_balance_worker, process_payment_worker, split_payment_worker, trigger_payment_ui_worker,
+    submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker, trigger_kyc_ui_worker,
     create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker,
     create_property_worker,
 ]
@@ -82,56 +85,47 @@ _lightweight_model = ChatGroq(
     model_kwargs={"parallel_tool_calls": False},
 )
 
-# --- Dedicated tool-selector embedding model ---
-
-_TOOL_SELECTOR_MODEL_NAME = "multi-qa-MiniLM-L6-cos-v1"
-_tool_selector_model: Optional[SentenceTransformer] = None
-_tool_selector_lock = threading.Lock()
-
-
-def _get_tool_selector_model() -> SentenceTransformer:
-    global _tool_selector_model
-    if _tool_selector_model is None:
-        with _tool_selector_lock:
-            if _tool_selector_model is None:
-                logger.info(f"Loading tool-selector model '{_TOOL_SELECTOR_MODEL_NAME}'...")
-                _tool_selector_model = SentenceTransformer(_TOOL_SELECTOR_MODEL_NAME)
-    return _tool_selector_model
-
+# --- Tool-selection embeddings ---
+# Tool description vectors are computed once (via OpenRouter, batched) and
+# cached at module scope — no local model, no per-request recomputation.
 
 TOP_K_TOOLS = 5
 _tool_embeddings_cache: Optional[Dict[str, list]] = None
 
 
-def _compute_tool_embeddings() -> Dict[str, list]:
-    model = _get_tool_selector_model()
-    names = list(TOOLS_BY_NAME.keys())
-    descriptions = [(TOOLS_BY_NAME[n].description or n) for n in names]
-    vectors = model.encode(descriptions)
-    return {name: vec.tolist() for name, vec in zip(names, vectors)}
-
-
 async def _get_tool_embeddings() -> Dict[str, list]:
     global _tool_embeddings_cache
     if _tool_embeddings_cache is None:
-        _tool_embeddings_cache = await asyncio.to_thread(_compute_tool_embeddings)
+        names = list(TOOLS_BY_NAME.keys())
+        descriptions = [(TOOLS_BY_NAME[n].description or n) for n in names]
+        vectors = await embed_texts_async(descriptions)
+        _tool_embeddings_cache = dict(zip(names, vectors))
     return _tool_embeddings_cache
 
 
 def _cosine(a: list, b: list) -> float:
-    a_arr, b_arr = np.array(a), np.array(b)
-    denom = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
-    return float(np.dot(a_arr, b_arr) / denom) if denom else 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
-async def select_tools_for_message(message: str, top_k: int=TOP_K_TOOLS) -> List[Tuple[BaseTool, float]]:
+async def select_tools_for_message(
+    message: str,
+    top_k: int = TOP_K_TOOLS,
+    precomputed_embedding: Optional[List[float]] = None,
+) -> List[Tuple[BaseTool, float]]:
+    """Ranks tools by semantic similarity to `message`.
+
+    Accepts an optional precomputed_embedding so invoke_lightweight_agent
+    can embed the user's message exactly once per turn and share it with
+    dynamic_intent_router, instead of each doing its own OpenRouter call
+    for the identical string.
+    """
     tool_embeddings = await _get_tool_embeddings()
-    msg_embedding = await asyncio.to_thread(lambda: _get_tool_selector_model().encode(message).tolist())
+    msg_embedding = precomputed_embedding if precomputed_embedding is not None else await embed_text_async(message)
 
-    scored = [
-        (t, _cosine(msg_embedding, tool_embeddings[t.name]))
-        for t in ALL_TOOLS
-    ]
+    scored = [(t, _cosine(msg_embedding, tool_embeddings[t.name])) for t in ALL_TOOLS]
     scored.sort(key=lambda x: x[1], reverse=True)
 
     ranked = [(t.name, round(score, 3)) for t, score in scored]
@@ -161,7 +155,7 @@ TOOL_UI_FALLBACKS: Dict[str, ToolUIFallback] = {
         prompt_message="I'd be happy to help schedule a tour. Please select a valid property or pick your preferred date and time:",
         force_threshold=0.35,
     ),
-    
+
     "submit_application_worker": ToolUIFallback(
     ui_component="lease_application_signer",
     action="lease_ui",
@@ -243,7 +237,7 @@ def _arg_is_grounded_in_conversation(field_name: str, value: object, messages: L
                     content = str(msg.get("content", ""))
                 else:
                     content = str(getattr(msg, "content", ""))
-                
+
                 if text in content:
                     return True
             return False  # UUID is syntactically valid but never came from search results/history
@@ -369,7 +363,6 @@ def _is_empty_value(value: object) -> bool:
     return value in (None, "", [], {}, set())
 
 
-
 def _remove_ungrounded_datetime_args(args: dict, messages: List[dict]) -> dict:
     cleaned = dict(args)
 
@@ -477,20 +470,34 @@ async def invoke_lightweight_agent(
     last_user_msg = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
     )
-    
-    
-    intent = await dynamic_intent_router(last_user_msg)
+
+    # Embed the user's message at most once per turn, and share it between
+    # intent routing and tool selection — previously each called
+    # embed_text_async(last_user_msg) independently, doubling OpenRouter
+    # round trips on every single agent turn for the identical string.
+    last_user_embedding = await embed_text_async(last_user_msg) if last_user_msg else None
+
+    intent = await dynamic_intent_router(last_user_msg, precomputed_embedding=last_user_embedding)
     is_informational = (intent == "supervisor")
 
-    active_tools_with_scores = await select_tools_for_message(last_user_msg)
-    active_tools = [t for t, _ in active_tools_with_scores]
-    top_tool = active_tools_with_scores[0][0] if active_tools_with_scores else None
+    # Tool ranking is only ever used when tools actually get bound to the
+    # model below (the `else` branch of the is_informational check further
+    # down) — for informational/conversational turns, no tools are bound,
+    # so ranking them was previously wasted work (Python-side cosine scoring
+    # over every tool, plus its own embedding call if not shared above).
+    if is_informational:
+        active_tools_with_scores: List[Tuple[BaseTool, float]] = []
+        active_tools: List[BaseTool] = []
+        top_tool: Optional[BaseTool] = None
+    else:
+        active_tools_with_scores = await select_tools_for_message(
+            last_user_msg, precomputed_embedding=last_user_embedding
+        )
+        active_tools = [t for t, _ in active_tools_with_scores]
+        top_tool = active_tools_with_scores[0][0] if active_tools_with_scores else None
 
-    fast_path_args = None
-    
-    if not is_informational:
-        fast_path_args = try_rule_based_search(last_user_msg, top_tool) if top_tool else None
-        
+    fast_path_args = try_rule_based_search(last_user_msg, top_tool) if (not is_informational and top_tool) else None
+
     if fast_path_args:
         logger.info(f"[LIGHTWEIGHT] Fast-path search: {fast_path_args}")
         tool = cast(BaseTool, search_properties_worker)

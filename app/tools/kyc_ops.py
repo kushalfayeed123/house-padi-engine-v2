@@ -263,3 +263,19 @@ async def approve_kyc_worker(
     except Exception as e:
         logger.error(f"[KYC APPROVAL ERROR] {str(e)}")
         return f"KYC approval failure: {str(e)}"
+
+
+@tool("trigger_kyc_ui_worker")
+async def trigger_kyc_ui_worker(config: RunnableConfig) -> str:
+    """Triggered when the user wants to verify their identity or upload
+    documents — never for checking verification status, which
+    get_kyc_status_worker handles inline instead."""
+    safe_config = config or {}
+    user_id = safe_config.get("configurable", {}).get("user_id")
+
+    if not user_id:
+        return "Security Guardrail: Execution halted due to absent tenant identity context."
+
+    return json.dumps({
+        "redirect_url": "/profile/verify"
+    })

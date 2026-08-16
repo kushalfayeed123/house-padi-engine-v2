@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 from app.core.ui_registry import INTENT_PROTOTYPES
 from app.services.vector_service import embed_text_async, embed_texts_async
 
+
+
 SIMILARITY_THRESHOLD = 0.6
 
 _prototype_embeddings: Optional[Dict[str, List[List[float]]]] = None
@@ -47,18 +49,48 @@ async def _get_prototype_embeddings() -> Dict[str, List[List[float]]]:
     return _prototype_embeddings
 
 
-async def dynamic_intent_router(text: str) -> str:
-    """Dynamically routes intent based on semantic similarity."""
+# Minimum gap the top-scoring bucket must have over the runner-up to be
+# trusted as a clean, single-purpose match. A small margin here IS the
+# definition of a compound/ambiguous message (e.g. "what's my balance,
+# and can I pay rent" scores close on both a redirect bucket and its
+# read-only counterpart) — same concept as _FORCE_CLUSTER_MARGIN in
+# lightweight_agent.py, applied at the routing layer instead of the
+# tool-forcing layer.
+AMBIGUITY_MARGIN = 0.08
+
+
+async def dynamic_intent_router(
+    text: str,
+    precomputed_embedding: Optional[List[float]] = None,
+) -> Optional[str]:
+    """Dynamically routes intent based on semantic similarity.
+
+    Returns None when either (a) no bucket clears SIMILARITY_THRESHOLD, or
+    (b) the top bucket doesn't clearly beat the runner-up by
+    AMBIGUITY_MARGIN — the latter catches compound messages that
+    legitimately match two different intents at once (a balance check
+    phrased alongside a payment request, say) rather than forcing a
+    single winner that discards half of what the user asked.
+
+    Both cases correctly fall through to the normal tool-bound agent path
+    in invoke_lightweight_agent, letting the model itself decide what to
+    answer now vs. confirm before acting on.
+    """
     prototype_embeddings = await _get_prototype_embeddings()
-    user_embedding = await embed_text_async(text)
+    user_embedding = precomputed_embedding if precomputed_embedding is not None else await embed_text_async(text)
 
-    best_intent = "supervisor"
-    highest_score = 0.0
-
+    scored: List[tuple[str, float]] = []
     for intent, embeddings in prototype_embeddings.items():
         max_score = max(_cosine_similarity(user_embedding, proto) for proto in embeddings)
-        if max_score > SIMILARITY_THRESHOLD and max_score > highest_score:
-            highest_score = max_score
-            best_intent = intent
+        scored.append((intent, max_score))
 
-    return best_intent
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_intent, top_score = scored[0]
+    runner_up_score = scored[1][1] if len(scored) > 1 else 0.0
+
+    if top_score <= SIMILARITY_THRESHOLD:
+        return None
+    if (top_score - runner_up_score) < AMBIGUITY_MARGIN:
+        return None
+
+    return top_intent
