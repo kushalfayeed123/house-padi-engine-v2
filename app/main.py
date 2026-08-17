@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from logging import getLogger
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter, Header, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, APIRouter, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
@@ -92,20 +92,25 @@ async def root_health_check():
 internal_router = APIRouter(prefix="/api/internal", tags=["Internal"])
 
 @internal_router.post("/run-enrichment")
-async def run_enrichment(x_internal_secret: str = Header(None)):
+async def run_enrichment(background_tasks: BackgroundTasks, x_internal_secret: str = Header(None)):
     expected_secret = os.getenv("INTERNAL_CRON_SECRET", "house-padi-super-secret")
     if x_internal_secret != expected_secret:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     
     try:
-        # Lazy-import property_cron here so it only loads into memory when the cron endpoint is called, 
-        # completely preventing startup blocking and port timeouts on Render.
+        # Lazy-import property_cron
         from app.services import property_cron
-        await property_cron.run_pending_property_enrichment_sweep()
-        return {"status": "success", "message": "AI enrichment sweep completed."}
+        
+        # Hand off the task to FastAPI's background thread/task manager
+        background_tasks.add_task(property_cron.run_pending_property_enrichment_sweep)
+        
+        # Returns 200 OK immediately while the sweep runs in the background
+        return {"status": "success", "message": "AI enrichment sweep triggered in the background."}
+        
     except Exception as e:
-        logger.error(f"Error in enrichment sweep: {e}", exc_info=True)
+        logger.error(f"Error triggering enrichment sweep: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+    
 # Register the internal router to the app
 app.include_router(internal_router)
