@@ -93,7 +93,7 @@ async def search_properties_worker(
                     "filters": {
                         "bedrooms": bedrooms,
                         "location": location,
-                        "status": "available",
+                        "status": "published",
                     },
                     "lat": None,
                     "lng": None,
@@ -280,7 +280,7 @@ async def get_featured_worker(limit: int = 6) -> str:
                 )
                 
                 db_records = res.data if res.data else []
-                valid_status_map = {r["id"]: r for r in db_records if r.get("is_featured") and r.get("status") == "available"}
+                valid_status_map = {r["id"]: r for r in db_records if r.get("is_featured") and r.get("status") == "published"}
                 
                 # Check if all cached items are still featured and available
                 if len(valid_status_map) == len(cached_properties):
@@ -299,7 +299,7 @@ async def get_featured_worker(limit: int = 6) -> str:
             supabase_client.table("properties")
             .select("*")
             .eq("is_featured", True)
-            .eq("status", "available")
+            .eq("status", "published")
             .limit(limit)
             .execute
         )

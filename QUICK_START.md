@@ -11,16 +11,22 @@ git checkout agents/multi-agent-property-rental-system
 
 2. Create virtualenv and install
 ```bash
+# Preferred: uv (uses pyproject.toml + uv.lock)
+uv sync
+
+# Fallback: pip
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 3. Configure environment (.env)
-- Copy .env.example to .env and fill values:
-  - SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-  - GROQ_API_KEY
-  - BACKEND_JWT_SECRET
+- Copy `.env.example` to `.env` and fill values:
+  - SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  (required)
+  - GROQ_API_KEY (required for chat)
+  - OPENROUTER_API_KEY (required for property search/embeddings)
+  - PAYMENT_PROVIDER, PAYMENT_SECRET_KEY, PAYMENT_WEBHOOK_SECRET (payments)
+  - CORS_ORIGINS (must be an explicit allow-list in production)
 
 4. Start Ollama (local model)
 ```bash

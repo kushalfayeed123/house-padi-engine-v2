@@ -118,7 +118,7 @@ class PropertyAIService:
             "metadata": updated_metadata,
             "features": ai_result.get("features", {}),
             "embedding": embedding,
-            "status": "available",
+            "status": "published",
             "aiSummary": ai_result.get("ai_summary", title),
         }
 
@@ -131,7 +131,7 @@ class PropertyAIService:
             try:
                 response = self.supabase.table("properties") \
                     .select("id") \
-                    .neq("status", "available") \
+                    .neq("status", "published") \
                     .limit(20) \
                     .execute()
                 

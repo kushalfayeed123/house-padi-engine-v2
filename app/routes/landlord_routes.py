@@ -31,7 +31,7 @@ async def get_landlord_overview(config: dict = Depends(get_optional_user_context
             .execute()
         )
         properties = prop_res.data if prop_res.data else []
-        active_listings = [p for p in properties if p.get("status") == "available"]
+        active_listings = [p for p in properties if p.get("status") == "published"]
 
         # 2. Fetch Tours
         tour_res = await db.execute(

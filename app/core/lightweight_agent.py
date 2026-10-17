@@ -77,13 +77,27 @@ ALL_TOOLS: List[BaseTool] = [
 ]
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
-_lightweight_model = ChatGroq(
-    model=LIGHTWEIGHT_MODEL_NAME,
-    api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
-    temperature=0,
-    max_retries=3,
-    model_kwargs={"parallel_tool_calls": False},
-)
+_lightweight_model: Optional[ChatGroq] = None
+
+
+def get_lightweight_model() -> ChatGroq:
+    """Lazily construct the Groq client.
+
+    Constructing ``ChatGroq`` requires ``GROQ_API_KEY`` and validates it at
+    construction time, so doing it at import time made the whole app fail to
+    boot without the key (including endpoints that never touch an LLM). Build
+    it on first use instead.
+    """
+    global _lightweight_model
+    if _lightweight_model is None:
+        _lightweight_model = ChatGroq(
+            model=LIGHTWEIGHT_MODEL_NAME,
+            api_key=SecretStr(os.getenv("GROQ_API_KEY") or ""),
+            temperature=0,
+            max_retries=3,
+            model_kwargs={"parallel_tool_calls": False},
+        )
+    return _lightweight_model
 
 # --- Tool-selection embeddings ---
 # Tool description vectors are computed once (via OpenRouter, batched) and
@@ -547,14 +561,14 @@ async def invoke_lightweight_agent(
 
     if is_informational:
         logger.info(f"[LIGHTWEIGHT] Informational query detected (intent: {intent}). Bypassing tool binding.")
-        dynamic_model = _lightweight_model
+        dynamic_model = get_lightweight_model()
     else:
         force_tool_name = _find_force_candidate(active_tools_with_scores)
         if force_tool_name:
             logger.info(f"[LIGHTWEIGHT] Forcing tool '{force_tool_name}' from ranked candidates")
-            dynamic_model = _lightweight_model.bind_tools(active_tools, tool_choice=force_tool_name)
+            dynamic_model = get_lightweight_model().bind_tools(active_tools, tool_choice=force_tool_name)
         else:
-            dynamic_model = _lightweight_model.bind_tools(active_tools)
+            dynamic_model = get_lightweight_model().bind_tools(active_tools)
 
     try:
         response = await dynamic_model.ainvoke(full_messages, config=tool_config)
@@ -697,7 +711,7 @@ async def invoke_lightweight_agent(
                 "messages": trimmed + [response] + [tool_msg]
             }
     # Final Turn using UNBOUND raw model
-    final = await _lightweight_model.ainvoke(full_messages + [response] + tool_messages, config=tool_config)
+    final = await get_lightweight_model().ainvoke(full_messages + [response] + tool_messages, config=tool_config)
 
     final_text = str(final.content or "").strip()
 

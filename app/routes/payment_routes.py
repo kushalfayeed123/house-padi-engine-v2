@@ -1,185 +1,205 @@
-"""
-Payment Router
-Exposes endpoints for payment initialization, webhook handlers, wallet balance checks,
-and admin fee splitting.
+"""Payment Router.
+
+Endpoints for checkout initialisation, gateway webhooks, frontend callback
+verification, wallet balance, transaction polling and admin fee splitting.
+
+Design notes
+------------
+* Amounts are always computed server-side from the lease (see
+  ``app.services.payment_service``). The client only ever sends a ``lease_id``.
+* The webhook verifies the gateway signature *before* parsing, dedupes on the
+  gateway reference and reconciles the amount before any money moves.
+* Errors use one machine-readable envelope so the frontend branches on ``code``.
 """
 
-import hmac
-import hashlib
-import json
-from typing import Optional, cast
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, Body
-from langchain_core.tools import BaseTool
-from app.core.config import settings
-from app.core.dependecies import get_optional_user_context
-from app.tools.payment_ops import get_wallet_balance_worker, process_payment_worker, split_payment_worker  # Ensure WEBHOOK_SECRET is configured here
+from typing import Optional
 
+from fastapi import APIRouter, Body, Depends, Header, Request, status
+from fastapi.responses import JSONResponse
+
+from app.core.dependecies import require_user_context
+from app.models.payment import (
+    PaymentError,
+    PaymentInitRequest,
+    PaymentInitResponse,
+    PaymentStatusResponse,
+    WebhookAck,
+    WalletResponse,
+)
+from app.services.payment_gateway import WebhookVerificationError
+from app.services.payment_service import (
+    PaymentError as DomainPaymentError,
+    build_default_payment_service,
+)
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
-# ============================================================================
-# 1. WEBHOOK ENDPOINT (Activates process_payment_worker)
-# ============================================================================
-
-@router.post("/webhook")
-async def payment_gateway_webhook(
-    request: Request,
-    x_paystack_signature: Optional[str] = Header(None, alias="x-paystack-signature"),
-    x_webhook_secret: Optional[str] = Header(None, alias="x-webhook-secret")
-):
-    """Webhook listener for payment gateways (e.g., Paystack, Flutterwave, Stripe).
-    
-    Upon successful payment verification:
-    1. Validates signature / security headers.
-    2. Extracts `lease_id`, `amount`, and `payer_id` from metadata.
-    3. Triggers `process_payment_worker` to activate lease, upload PDF, and update status.
-    """
-    body_bytes = await request.body()
-    
-    # --- Signature Verification (Paystack Example) ---
-    webhook_secret = getattr(settings, "PAYMENT_WEBHOOK_SECRET", "")
-    
-    # if x_paystack_signature:
-    #     computed_signature = hmac.new(
-    #         webhook_secret.encode("utf-8"),
-    #         body_bytes,
-    #         hashlib.sha512
-    #     ).hexdigest()
-    #     if not hmac.compare_digest(computed_signature, x_paystack_signature):
-    #         raise HTTPException(status_code=401, detail="Invalid webhook signature signature.")
-    # elif x_webhook_secret != webhook_secret:
-    #     # Generic Secret Header Check Fallback
-    #     raise HTTPException(status_code=401, detail="Invalid webhook secret authorization.")
-
-    try:
-        payload = json.loads(body_bytes.decode("utf-8"))
-        event_type = payload.get("event") or payload.get("type")
-        data = payload.get("data", payload)
-
-        # Only process successful charges
-        if event_type not in ["charge.success", "payment_intent.succeeded", "successful_payment"]:
-            return {"status": "ignored", "message": f"Event {event_type} ignored."}
-
-        # Extract metadata passed during checkout initialization
-        metadata = data.get("metadata", {})
-        lease_id = metadata.get("lease_id")
-        payer_id = metadata.get("user_id") or metadata.get("payer_id")
-        amount = float(data.get("amount", 0)) / 100.0 if "paystack" in str(request.url) else float(data.get("amount", 0))
-
-        if not lease_id or not payer_id:
-            raise HTTPException(status_code=400, detail="Missing lease_id or payer_id in payment metadata.")
-
-        # --- Invoke process_payment_worker ---
-        tool = cast(BaseTool, process_payment_worker)
-        result = await tool.ainvoke(
-            {
-                "lease_id": lease_id,
-                "amount": amount,
-                "payment_method": data.get("channel", "card")
-            },
-            config={
-                "configurable": {
-                    "user_id": payer_id,
-                    "user_role": "renter"
-                }
-            }
-        )
-
-        res_str = str(result)
-        if "Security Guardrail" in res_str or "Error:" in res_str:
-            return {"status": "failed", "detail": res_str}
-
-        return {"status": "success", "worker_response": res_str}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Webhook processing error: {str(e)}")
+def get_payment_service():
+    """FastAPI dependency. Tests override this via ``app.dependency_overrides``."""
+    return build_default_payment_service()
 
 
-# ============================================================================
-# 2. RENTER PAYMENTS & CHECKOUT INITIATION
-# ============================================================================
-
-@router.post("/initialize")
-async def initialize_lease_payment(
-    lease_id: str = Body(..., embed=True),
-    amount: float = Body(..., embed=True),
-    context: dict = Depends(get_optional_user_context)
-):
-    """Initializes payment metadata before redirecting renter to checkout gateway."""
-    user_id = context.get("id") if context else None
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required.")
-
-    # In production, pass these metadata fields to your Payment Gateway API (e.g., Paystack/Stripe payload)
-    return {
-        "status": "success",
-        "checkout_metadata": {
-            "lease_id": lease_id,
-            "user_id": user_id,
-            "amount": amount,
-            "email": context.get("email")
-        },
-        "message": "Pass checkout_metadata to payment gateway SDK."
-    }
+def _request_id(request: Request) -> Optional[str]:
+    return getattr(request.state, "request_id", None)
 
 
-# ============================================================================
-# 3. WALLET & BALANCE ENDPOINTS
-# ============================================================================
-
-@router.get("/wallet")
-async def get_wallet_balance(context: dict = Depends(get_optional_user_context)):
-    """Fetches authenticated user's wallet balance and recent ledger activity."""
-    user_id = context.get("id") if context else None
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required.")
-
-    tool = cast(BaseTool, get_wallet_balance_worker)
-    result = await tool.ainvoke(
-        {},
-        config={"configurable": {"user_id": user_id}}
+def _error_response(exc: DomainPaymentError, request: Request) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.http_status,
+        content=PaymentError(
+            code=exc.code,
+            message=exc.message,
+            transaction_id=exc.transaction_id,
+            request_id=_request_id(request),
+        ).model_dump(mode="json"),
     )
 
+
+# ============================================================================
+# 1. CHECKOUT INITIALISATION
+# ============================================================================
+@router.post("/initialize", response_model=PaymentInitResponse)
+async def initialize_lease_payment(
+    request: Request,
+    body: PaymentInitRequest,
+    context: dict = Depends(require_user_context),
+    service=Depends(get_payment_service),
+):
+    """Start a payment for a lease.
+
+    The server reads the amount from the lease; the returned ``checkout`` payload
+    is handed to the gateway SDK/redirect. Safe to retry: while a transaction is
+    open the endpoint returns 409 with the existing ``transaction_id``.
+    """
     try:
-        return json.loads(str(result))
-    except json.JSONDecodeError:
-        return {"status": "success", "raw": str(result)}
+        return await service.initialize(
+            lease_id=body.lease_id,
+            user_id=context["id"],
+            email=context.get("email"),
+        )
+    except DomainPaymentError as exc:
+        return _error_response(exc, request)
 
 
 # ============================================================================
-# 4. ADMIN SPLIT FEE ENDPOINT
+# 2. WEBHOOK
 # ============================================================================
+@router.post("/webhook", response_model=WebhookAck)
+async def payment_gateway_webhook(
+    request: Request,
+    service=Depends(get_payment_service),
+):
+    """Gateway webhook listener (Paystack / Flutterwave / mock).
 
+    Returns 401 for a bad signature, 200 for every verified event (including
+    duplicates and ignored event types), and 500 only when our own datastore is
+    unavailable so the gateway retries.
+    """
+    raw_body = await request.body()
+    headers = dict(request.headers)
+
+    try:
+        return await service.handle_webhook(raw_body, headers)
+    except WebhookVerificationError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content=PaymentError(
+                code="invalid_signature",
+                message=str(exc),
+                request_id=_request_id(request),
+            ).model_dump(mode="json"),
+        )
+    except DomainPaymentError as exc:
+        return _error_response(exc, request)
+    except Exception as exc:  # datastore failure -> let the gateway retry
+        logger_error = f"[PAYMENT WEBHOOK] unexpected failure: {exc}"
+        import logging
+
+        logging.getLogger("uvicorn").error(logger_error)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=PaymentError(
+                code="internal_error",
+                message="Webhook processing failed; please retry.",
+                request_id=_request_id(request),
+            ).model_dump(mode="json"),
+        )
+
+
+# ============================================================================
+# 3. FRONTEND CALLBACK VERIFICATION + POLLING
+# ============================================================================
+@router.get("/verify/{reference}", response_model=PaymentStatusResponse)
+async def verify_payment(
+    reference: str,
+    request: Request,
+    context: dict = Depends(require_user_context),
+    service=Depends(get_payment_service),
+):
+    """Reconcile a payment after the gateway redirects the browser back.
+
+    Idempotent: safe for the frontend to call on every page load/poll.
+    """
+    try:
+        return await service.verify(
+            reference=reference,
+            user_id=context["id"],
+            role=context.get("role", "renter"),
+        )
+    except DomainPaymentError as exc:
+        return _error_response(exc, request)
+
+
+@router.get("/transactions/{transaction_id}", response_model=PaymentStatusResponse)
+async def get_transaction_status(
+    transaction_id: str,
+    request: Request,
+    context: dict = Depends(require_user_context),
+    service=Depends(get_payment_service),
+):
+    """Poll a transaction's canonical status (used by the frontend spinner)."""
+    try:
+        return await service.get_transaction(
+            transaction_id=transaction_id,
+            user_id=context["id"],
+            role=context.get("role", "renter"),
+        )
+    except DomainPaymentError as exc:
+        return _error_response(exc, request)
+
+
+# ============================================================================
+# 4. WALLET
+# ============================================================================
+@router.get("/wallet", response_model=WalletResponse)
+async def get_wallet(
+    context: dict = Depends(require_user_context),
+    service=Depends(get_payment_service),
+):
+    """Authenticated user's wallet balance and recent transactions."""
+    return await service.get_wallet(context["id"])
+
+
+# ============================================================================
+# 5. ADMIN SPLIT FEE
+# ============================================================================
 @router.post("/{transaction_id}/split")
 async def execute_payment_split(
     transaction_id: str,
+    request: Request,
     landlord_percentage: float = Body(95.0, embed=True),
-    context: dict = Depends(get_optional_user_context)
+    context: dict = Depends(require_user_context),
+    service=Depends(get_payment_service),
 ):
-    """Admin endpoint to finalize fee distribution for a processed transaction."""
-    user_id = context.get("id") if context else None
-    user_role = context.get("role", "renter") if context else "renter"
-
-    if not user_id or user_role not in ["admin", "system"]:
-        raise HTTPException(status_code=403, detail="Admin authorization required.")
-
-    tool = cast(BaseTool, split_payment_worker)
-    result = await tool.ainvoke(
-        {
-            "transaction_id": transaction_id,
-            "landlord_percentage": landlord_percentage
-        },
-        config={
-            "configurable": {
-                "user_id": user_id,
-                "user_role": user_role
-            }
-        }
-    )
-
-    res_str = str(result)
-    if "Security Guardrail" in res_str:
-        raise HTTPException(status_code=403, detail=res_str)
-    
-    return {"status": "success", "message": res_str}
+    """Admin endpoint to finalize fee distribution for a transaction."""
+    try:
+        result = await service.split(
+            transaction_id=transaction_id,
+            landlord_percentage=landlord_percentage,
+            actor_id=context["id"],
+            role=context.get("role", "renter"),
+        )
+    except DomainPaymentError as exc:
+        return _error_response(exc, request)
+    return {"status": "success", **(result or {})}
