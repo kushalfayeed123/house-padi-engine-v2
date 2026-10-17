@@ -14,7 +14,10 @@ from langgraph.graph import add_messages
 
 from app.tools.property_ops import create_property_worker, search_properties_worker
 from app.tools.tour_ops import book_tour_worker, list_tours_worker, approve_tour_worker
-from app.tools.lease_ops import create_lease_worker, sign_lease_worker, evaluate_application_worker
+from app.tools.application_lease_ops import (
+    manage_application_worker,
+    submit_application_worker,
+)
 from app.tools.payment_ops import process_payment_worker, get_wallet_balance_worker, split_payment_worker
 from app.tools.kyc_ops import submit_kyc_worker, get_kyc_status_worker, approve_kyc_worker
 from app.tools.chat_ops import create_chat_thread_worker, send_message_worker, get_messages_worker, list_threads_worker
@@ -189,13 +192,14 @@ tour_agent: SubAgent = {
 
 lease_agent: SubAgent = {
     "name": "lease-specialist",
-    "description": "Create leases, handle signing, evaluate applications.",
+    "description": "Handle rental applications: submit, approve and reject.",
     "system_prompt": (
-        "You are a lease compliance expert. Handle lease creation, signing, and application evaluation.\n"
-        "Use `create_lease_worker` to create lease agreements, `sign_lease_worker` to sign them, "
-        "and `evaluate_application_worker` to approve or reject rental applications with AI screening."
+        "You are a lease compliance expert. Handle rental application submission, "
+        "landlord approval and rejection.\n"
+        "Use `submit_application_worker` to submit a renter's application and "
+        "`manage_application_worker` to approve or reject it with AI screening."
     ),
-    "tools": [create_lease_worker, sign_lease_worker, evaluate_application_worker],
+    "tools": [submit_application_worker, manage_application_worker],
     "model": groq_model
 }
 
@@ -263,7 +267,7 @@ def create_graph_with_selected_model():
         backend=tenant_isolated_store,
         subagents=[property_agent, tour_agent, lease_agent, payment_agent, kyc_agent, chat_agent],
         interrupt_on={
-            "evaluate_application_worker": True,
+            "manage_application_worker": True,
             "approve_kyc_worker": True
         }
     )

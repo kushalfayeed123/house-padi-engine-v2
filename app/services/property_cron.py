@@ -18,7 +18,7 @@ async def run_pending_property_enrichment_sweep():
     try:
         response = ai_service.supabase.table("properties") \
             .select("id") \
-            .neq("status", "available") \
+            .neq("status", "published") \
             .limit(20) \
             .execute()
         
